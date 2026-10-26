@@ -91,10 +91,13 @@ def test_merged_orbs_in_zone_become_food_not_wall():
 
 
 def test_food_pile_becomes_pit_target():
-    vision, brain = Vision(VCFG), Brain(BrainConfig(pit_min_mass=300))
+    vision, brain = Vision(VCFG), Brain(BrainConfig())
     img = syn.background()
     own_snake(img)
-    syn.draw_food(img, (480, 90), 40, 30, seed=4)        # dense pile straight up
+    rng = np.random.default_rng(4)
+    for _ in range(12):                                   # pile of big orbs straight up
+        x, y = 480 + rng.uniform(-45, 45), 90 + rng.uniform(-30, 30)
+        cv2.circle(img, (int(x), int(y)), 6, (255, 120, 255), -1)
     a = brain.decide(vision.analyze(img, 0.0))
     assert a.mode is Mode.LOOT
     assert abs(wrap(a.angle + math.pi / 2)) < math.radians(20)

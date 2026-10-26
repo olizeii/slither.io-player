@@ -104,6 +104,8 @@ class Brain:
         self.zones: list[LootZone] = []
         self._last_t: float | None = None
         self._last_boost = False
+        self._ego = np.zeros(2)                    # our own integrated movement (prey detection)
+        self._food_hist: list[tuple[float, np.ndarray]] = []
         # per-frame views of the scene after loot handling (see _apply_loot)
         self._obstacles: np.ndarray | None = None
         self._food: np.ndarray | None = None
@@ -204,12 +206,14 @@ class Brain:
         if not s.alive:
             self.maneuver = None
             self.zones = []
+            self._food_hist = []
             self.tracker.reset()
             return Action(self.last_angle, False, Mode.DEAD)
 
         cx, cy = s.center
         tracks = self.tracker.update(s.heads, t, cx, cy)
         self._update_heading(s, dt)
+        s.food = self._discount_movers(s, cx, cy, t, dt)
         self._update_loot(s, tracks, cx, cy, t, dt)
         self._obstacles, self._food = self._apply_loot(s, cx, cy)
         self_r = max(s.self_radius, cfg.min_self_radius)
@@ -285,6 +289,35 @@ class Brain:
         self._last_boost = boost
         return Action(angle, boost, mode, dbg)
 
+    # ================================================================ prey
+    def _discount_movers(self, s: GameState, cx: float, cy: float, t: float, dt: float) -> np.ndarray:
+        """Big glowing things that fly across the screen (slither.io 'prey') are hard
+        to catch and pull the bot off course. Food does not move in the world, so
+        anything big that does gets only a fraction of its weight. A weight cap
+        keeps single giant blobs from dominating the food map as well.
+        """
+        cfg = self.cfg
+        speed = cfg.boost_speed_px_s if self._last_boost else cfg.base_speed_px_s
+        self._ego += speed * dt * np.array([math.cos(self.heading), math.sin(self.heading)])
+        food = s.food.copy() if len(s.food) else s.food
+        movers = np.zeros(len(food), bool)
+        if len(food):
+            np.minimum(food[:, 2], cfg.food_weight_cap, out=food[:, 2])
+            big = np.flatnonzero(food[:, 2] >= cfg.loot_item_min_weight)
+            world = food[big, :2] - (cx, cy) + self._ego        # food position in the world
+            past = min((e for e in self._food_hist if 0.15 <= t - e[0] <= 0.5),
+                       key=lambda e: abs(t - e[0] - 0.25), default=None)
+            if past is not None and len(past[1]) and len(big):
+                d = np.hypot(world[:, None, 0] - past[1][None, :, 0],
+                             world[:, None, 1] - past[1][None, :, 1]).min(axis=1)
+                # moved a bit = prey; nothing close at all = new (e.g. fresh remains)
+                movers[big[(d > cfg.prey_min_shift) & (d < cfg.prey_max_shift)]] = True
+                food[movers, 2] *= cfg.prey_weight
+            self._food_hist.append((t, world))
+        self._food_hist = [e for e in self._food_hist if t - e[0] <= 0.6]
+        s.debug["movers"] = movers
+        return food
+
     # ================================================================ loot
     def _loot_items(self, s: GameState, cx: float, cy: float) -> np.ndarray:
         """Relative (x, y, mass) of everything that could be remains of a snake."""
@@ -358,7 +391,12 @@ class Brain:
         iy = np.clip((s.food[:, 1] / cell).astype(int), 0, gh - 1)
         grid = np.zeros((gh, gw), np.float32)
         np.add.at(grid, (iy, ix), s.food[:, 2])
+        count = np.zeros((gh, gw), np.float32)    # separate big items: remains are many orbs,
+        big = s.food[:, 2] >= cfg.loot_item_min_weight   # one giant blob is not a pile
+        np.add.at(count, (iy[big], ix[big]), 1.0)
         box = cv2.boxFilter(grid, -1, (3, 3), normalize=False, borderType=cv2.BORDER_CONSTANT)
+        nbox = cv2.boxFilter(count, -1, (3, 3), normalize=False, borderType=cv2.BORDER_CONSTANT)
+        box[nbox < cfg.pit_min_items] = 0
         j = int(np.argmax(box))
         average = 9.0 * float(grid.mean())         # what a 3x3 block holds on average
         if box.flat[j] < max(cfg.pit_min_mass, cfg.pit_density_ratio * average):
@@ -469,7 +507,9 @@ class Brain:
 
     def _find_cutoff(self, s, tracks, cx, cy, margin, t) -> _Maneuver | None:
         cfg = self.cfg
-        if cfg.cutoff_enabled and s.self_area >= cfg.boost_min_self_area:
+        if cfg.cutoff_enabled:
+            # small snakes cannot boost but can still cut off, just at normal speed
+            our_speed = cfg.boost_speed_px_s if s.self_area >= cfg.boost_min_self_area else cfg.base_speed_px_s
             best = None
             for tr in tracks:
                 if not (cfg.cutoff_min_dist <= tr.dist <= cfg.cutoff_max_dist):
@@ -485,7 +525,7 @@ class Brain:
                     if not (-0.5 < side < 0.5):
                         break
                     t_enemy = lead / speed
-                    t_us = float(np.hypot(*P)) / cfg.boost_speed_px_s
+                    t_us = float(np.hypot(*P)) / our_speed
                     if t_us >= t_enemy * cfg.cutoff_time_margin:
                         continue
                     p = self._profiles(s, tracks, cx, cy, margin, exclude_id=tr.id)

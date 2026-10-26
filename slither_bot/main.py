@@ -26,13 +26,18 @@ from . import debug as debug_view
 from . import win32
 from .brain import Brain, Mode
 from .capture import LatestFrameBuffer, ScreenCapture
-from .config import AGGRESSIVE, BotConfig, apply_brain_params, load_config
+from .config import AGGRESSIVE, PROFILE_VERSION, BotConfig, apply_brain_params, load_config
 from .controller import MouseController
 from .episode import EpisodeTracker
 from .hud import HudReader
 from .minimap import analyze_minimap, apply_minimap
-from .tuner import SPACE, Tuner
+from .tuner import SPACE, Tuner, style, style_line
 from .vision import GameState, Vision
+
+
+def short_style(params: dict) -> str:
+    st = style(params)
+    return f"Aggr {st['Aggression']}% Vors {st['Vorsicht']}% Gier {st['Gier']}% Loot {st['Loot']}%"
 
 
 def locate_game(cfg: BotConfig) -> tuple[int | None, tuple[int, int, int, int]]:
@@ -104,18 +109,25 @@ class Stats:
         self.latency = 0.0
         self.fps = 0.0
         self.text = ""
+        self.modes: dict[str, int] = {}
+        self.style = ""              # short play-style tag, set by run()
 
     def tick(self, work_s: float, latency_s: float, mode: Mode, extra: str = "") -> None:
         self.frames += 1
         self.work += work_s
         self.latency += latency_s
+        if mode is not Mode.DEAD:
+            self.modes[mode.value] = self.modes.get(mode.value, 0) + 1
         now = time.perf_counter()
         if now - self.t0 >= self.interval:
             self.fps = self.frames / (now - self.t0)
-            self.text = (f"fps={self.fps:5.1f} vision+brain={1000 * self.work / self.frames:5.1f}ms "
-                         f"latency={1000 * self.latency / self.frames:5.1f}ms")
-            print(f"[stats] {self.text} mode={mode.value} {extra}")
-            self.t0, self.frames, self.work, self.latency = now, 0, 0.0, 0.0
+            self.text = (f"fps={self.fps:4.0f} {1000 * self.work / self.frames:4.1f}ms "
+                         f"lat={1000 * self.latency / self.frames:4.1f}ms")
+            total = sum(self.modes.values())
+            doing = " ".join(f"{k} {100 * v / total:.0f}%" for k, v in
+                             sorted(self.modes.items(), key=lambda kv: -kv[1])[:3]) if total else "-"
+            print(f"[stats] {self.text} | {extra} | gerade: {doing} | {self.style}")
+            self.t0, self.frames, self.work, self.latency, self.modes = now, 0, 0.0, 0.0, {}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -181,12 +193,18 @@ def run(cfg: BotConfig, train: bool = False) -> None:
     tuner = tracker = None
     role = "-"
     if train:
-        tuner = Tuner(cfg.train, {p.name: getattr(cfg.brain, p.name) for p in SPACE})
+        tuner = Tuner(cfg.train, {p.name: getattr(cfg.brain, p.name) for p in SPACE},
+                      version=PROFILE_VERSION)
+        if tuner.notice:
+            print(tuner.notice)
         role, params = tuner.next_params()
         apply_brain_params(cfg, params)
         tracker = EpisodeTracker(hud, cfg.train.final_length_wait_s)
         print(f"[train] state in {tuner.state_path} - {tuner.state['episodes']} rounds so far, "
               f"best length {tuner.state['best_length']}, next round plays the {role}")
+        print(f"        {tuner.trend_line()}")
+    current = {p.name: getattr(cfg.brain, p.name) for p in SPACE}
+    print(f"[init] {style_line(current)}")
 
     vision = Vision(cfg.vision)
     brain = Brain(cfg.brain)
@@ -194,6 +212,7 @@ def run(cfg: BotConfig, train: bool = False) -> None:
     respawner = Respawner(cfg, region, controller)
     hotkeys = win32.Hotkeys({"pause": win32.VK_F8, "debug": win32.VK_F9, "quit": win32.VK_F12})
     stats = Stats(cfg.runtime.stats_interval_s)
+    stats.style = short_style(current)
 
     paused = cfg.runtime.start_paused
     show_debug = cfg.runtime.debug
@@ -250,13 +269,14 @@ def run(cfg: BotConfig, train: bool = False) -> None:
                     role, params = tuner.next_params()
                     apply_brain_params(cfg, params)
                     brain = Brain(cfg.brain)          # fresh brain with the next parameter set
-                    print(f"[train] next round: {role}")
+                    stats.style = short_style(params)
+                    print(f"[train] next round: {tuner.describe(role)}")
             # never click "Play Again" before the final length has been read
             if cfg.runtime.auto_respawn and running and (tracker is None or tracker.phase != "ending"):
                 respawner.update(state, t1)
 
             hv = hud.snapshot()
-            extra = f"len={hv.length} rank={hv.rank}/{hv.players}" if hud.available else ""
+            extra = f"Länge {hv.length} Rang {hv.rank}/{hv.players}" if hud.available else "kein OCR"
             stats.tick(t1 - t0, t1 - frame.timestamp, action.mode, extra)
             if show_debug and frame_no % cfg.runtime.debug_every == 0:
                 info = stats.text + (" PAUSED" if paused else "") + (f" [{role}]" if train else "")

@@ -186,9 +186,16 @@ class BrainConfig:
     # PIT: big accumulations of food anywhere in view (several dead snakes, big kills)
     pit_enabled: bool = True
     pit_cell: float = 70.0
-    pit_min_mass: float = 900.0           # normal food clusters reach ~400, dead snakes far more
-    pit_density_ratio: float = 6.0        # ... and must be this much denser than the frame average
+    pit_min_mass: float = 700.0           # normal food clusters reach ~400, dead snakes far more
+    pit_min_items: int = 6                # ... made of several separate big orbs ...
+    pit_density_ratio: float = 4.5        # ... and clearly denser than the frame average
                                           # (a real frame without kills peaked at ~4x)
+    # prey: big glowing things that fly across the screen. Food never moves in the
+    # world, so a big item that moved 30-150 px within 0.25 s is prey.
+    prey_min_shift: float = 30.0
+    prey_max_shift: float = 150.0
+    prey_weight: float = 0.15
+    food_weight_cap: float = 200.0        # one giant blob must not outweigh a whole pile
     pit_compete_ratio: float = 0.7        # skip if an enemy head is this much closer than us
     # minimap crowd: drift towards populated areas (more kills, more loot)
     w_crowd: float = 0.35
@@ -268,15 +275,20 @@ class BotConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
 
 
-# Starting point for --aggressive / --train: less fear, more boosting and hunting.
+# Starting point for --aggressive / --train: little fear, constant hunting, boosts a lot.
+# v2 (after first user feedback "too passive"): attacks bigger snakes too, cuts off
+# without boost, reacts to heads only when they really rush at us.
 AGGRESSIVE = {
-    "w_danger": 2.6, "danger_radius": 105.0, "clearance_factor": 1.3,
-    "hard_min_clearance": 28.0, "escape_danger": 0.7, "head_threat_radius": 130.0,
-    "w_food": 1.4, "feast_threshold": 150.0, "boost_min_self_area": 700,
-    "cutoff_size_ratio": 1.6, "cutoff_max_dist": 400.0, "cutoff_time_margin": 0.9,
-    "cutoff_min_enemy_speed": 40.0, "encircle_min_self_area": 3500,
-    "encircle_size_ratio": 0.8, "hunt_enabled": True,
+    "w_danger": 2.0, "danger_radius": 90.0, "clearance_factor": 1.2,
+    "hard_min_clearance": 24.0, "escape_danger": 0.8, "head_threat_radius": 110.0,
+    "head_threat_closing_speed": 80.0,
+    "w_food": 1.4, "feast_threshold": 120.0, "boost_min_self_area": 500,
+    "cutoff_size_ratio": 2.2, "cutoff_max_dist": 450.0, "cutoff_time_margin": 1.0,
+    "cutoff_min_enemy_speed": 30.0, "encircle_min_self_area": 2500,
+    "encircle_size_ratio": 1.0, "hunt_enabled": True, "hunt_radius": 520.0,
+    "hunt_size_ratio": 1.5, "w_crowd": 0.6, "loot_boost_dist": 60.0,
 }
+PROFILE_VERSION = 2   # bump when behaviour changes so much that old tuning scores are meaningless
 
 
 def apply_brain_params(cfg: BotConfig, params: dict) -> None:

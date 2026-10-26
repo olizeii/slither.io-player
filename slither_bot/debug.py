@@ -21,8 +21,12 @@ def render(frame: np.ndarray, state: GameState, action: Action | None = None,
         m = obstacle > 0
         img[m] = (0.4 * img[m] + 0.6 * np.array([40, 40, 255])).astype(np.uint8)
 
-    for x, y, wgt in state.food:
-        cv2.circle(img, (int(x), int(y)), 2 if wgt < 100 else 5, (80, 255, 80), -1)
+    movers = state.debug.get("movers")
+    for i, (x, y, wgt) in enumerate(state.food):
+        if movers is not None and i < len(movers) and movers[i]:
+            cv2.circle(img, (int(x), int(y)), 9, (255, 255, 0), 2)     # prey: ignored-ish
+        else:
+            cv2.circle(img, (int(x), int(y)), 2 if wgt < 100 else 5, (80, 255, 80), -1)
 
     if action is not None and action.debug:
         dbg = action.debug

@@ -208,6 +208,34 @@ So läuft es ab:
    - Die Schrittweite passt sich an: Sie wächst bei Erfolg und schrumpft bei Misserfolg (1/5-Regel).
 5. **Gedächtnis.** `tuning/state.json` (Lernstand), `tuning/episodes.csv` (jede Runde mit Länge, Rang, Dauer, Zeit pro Modus und Parametern) und `tuning/best_params.json`. Beim nächsten Start lernt der Bot dort weiter, wo er aufgehört hat.
 
+### Konsole: Spielstil, Verhalten, Lernkurve
+
+```
+[init] Spielstil: Aggression 75% | Vorsicht 28% | Gier 59% | Loot 64% | Crowd 50%  -> Typ: Jäger
+[stats] fps=59 16.2ms lat=21.3ms | Länge 77 Rang 32/80 | gerade: hunt 53% escape 17% cutoff 14% | Aggr 75% Vors 28% Gier 59% Loot 64%
+[train] round 12 (candidate) length=1843 rank=4/512 ...
+        Verhalten: forage 48% hunt 21% loot 12% escape 10% cutoff 9%
+        Lernkurve: Median letzte 10 Runden = 910, erste 10 = 640 (+42%), 3 Verbesserungen übernommen
+```
+
+- **Spielstil:** Wo die Parameter des aktuellen Satzes innerhalb ihrer Grenzen liegen (`tuner.STYLES`). Aggression = Cutoff/Hunt/Einkreisen gegen größere Gegner, frühes Boosten, wenig Angst. Vorsicht = Gefahrenradius, Sicherheitsabstand, Kopf-Vorhersage. „Typ“ ist der stärkste Zug.
+- **gerade / Verhalten:** Was der Bot tatsächlich tut, als Zeitanteil der Modi.
+- **Lernkurve:** Median der letzten 10 Runden gegen die ersten 10. Das ist erst ab ~20 Runden aussagekräftig.
+
+Ändert sich der Bot grundlegend (`PROFILE_VERSION` in `config.py`), beginnt der Tuner eine neue Baseline vom neuen Profil. Alte Scores wären mit dem neuen Verhalten nicht vergleichbar. Die alten Runden bleiben in `episodes.csv`.
+
+### Prey (fliegende Leuchtpunkte)
+
+slither.io hat neben Futter auch `preys`: große, leuchtende Punkte, die durchs Bild fliegen. Sie sind schwer zu fangen und lenken ab. Echtes Futter bewegt sich in der Welt nicht. Der Bot rechnet seine eigene Bewegung heraus. Ein großes Teil, das sich in 0,25 s um 30–150 px bewegt hat, gilt als Prey und zählt nur noch 15 %. Im Debug-Fenster bekommt es einen cyanfarbenen Ring. Außerdem ist das Gewicht eines einzelnen Teils gedeckelt (`food_weight_cap`). Ein Pit braucht mindestens 6 separate große Kugeln, ein einzelner riesiger Blob reicht nicht.
+
+### Wie viel bringt das Training wirklich?
+
+Ehrlich: Das Training stellt Regler ein, es erfindet kein neues Verhalten.
+- Eine einzelne Runde ist zu großen Teilen Glück (eine falsche Begegnung, und alles ist weg). Deshalb spielt jeder Kandidat 3 Runden.
+- Realistisch braucht es **50–100 Runden (ca. 4–8 Stunden)**, bis der Tuner eine Handvoll echter Verbesserungen gefunden hat. Erwartbar ist eine Steigerung der *mittleren* Länge um vielleicht 20–50 % gegenüber dem Startprofil. Danach flacht es ab.
+- Der größere Hebel sind Änderungen am Verhalten selbst (wie Loot, Prey, Aggression). Nach so einer Änderung lohnt sich wieder ein neuer Trainingslauf.
+- Woran du es siehst: an der `Lernkurve`-Zeile. Bleibt sie nach 30–40 Runden flach, ist das Profil ausgereizt, und weiteres Laufenlassen bringt nur noch wenig.
+
 Mit den besten gefundenen Parametern ohne weiteres Lernen spielen:
 
 ```bash

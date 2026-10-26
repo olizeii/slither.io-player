@@ -76,7 +76,51 @@ SPACE = [
     Param("loot_boost_dist", 40.0, 400.0, log=True),
     Param("pit_min_mass", 150.0, 1500.0, log=True),
     Param("w_crowd", 0.0, 1.2),
+    Param("head_threat_closing_speed", 30.0, 200.0, log=True),
+    Param("hunt_size_ratio", 0.6, 2.5),
 ]
+PARAMS = {p.name: p for p in SPACE}
+
+# Play style in %: where each knob sits inside its range (+1 = more of it, -1 = less).
+STYLES = {
+    "Aggression": [("cutoff_size_ratio", 1), ("cutoff_max_dist", 1), ("cutoff_time_margin", 1),
+                   ("hunt_radius", 1), ("hunt_size_ratio", 1), ("encircle_size_ratio", 1),
+                   ("encircle_min_self_area", -1), ("boost_min_self_area", -1),
+                   ("w_danger", -1), ("danger_radius", -1)],
+    "Vorsicht": [("w_danger", 1), ("danger_radius", 1), ("clearance_factor", 1),
+                 ("hard_min_clearance", 1), ("head_threat_radius", 1), ("head_predict_horizon_s", 1),
+                 ("escape_danger", -1), ("head_threat_closing_speed", -1)],
+    "Gier": [("w_food", 1), ("food_dist_scale", 1), ("feast_threshold", -1)],
+    "Loot": [("loot_max_dist", 1), ("loot_boost_dist", -1), ("pit_min_mass", -1)],
+    "Crowd": [("w_crowd", 1)],
+}
+STYLE_NAMES = {"Aggression": "Jäger", "Vorsicht": "Überlebender", "Gier": "Sammler",
+               "Loot": "Aasfresser", "Crowd": "Gedränge-Sucher"}
+
+
+def style(params: dict) -> dict[str, int]:
+    out = {}
+    for name, knobs in STYLES.items():
+        vals = []
+        for key, sign in knobs:
+            if key in params and key in PARAMS:
+                u = min(max(PARAMS[key].to_unit(float(params[key])), 0.0), 1.0)
+                vals.append(u if sign > 0 else 1.0 - u)
+        out[name] = round(100 * sum(vals) / len(vals)) if vals else 50
+    return out
+
+
+def style_line(params: dict) -> str:
+    st = style(params)
+    top = max(("Aggression", "Vorsicht", "Gier", "Loot"), key=lambda k: st[k])
+    return ("Spielstil: " + " | ".join(f"{k} {v}%" for k, v in st.items())
+            + f"  -> Typ: {STYLE_NAMES[top]}")
+
+
+def behaviour_line(modes: dict) -> str:
+    total = sum(modes.values()) or 1.0
+    parts = sorted(modes.items(), key=lambda kv: -kv[1])
+    return "Verhalten: " + " ".join(f"{k} {100 * v / total:.0f}%" for k, v in parts if v / total >= 0.01)
 
 
 @dataclass
@@ -103,7 +147,8 @@ def _mean(xs: list[float]) -> float:
 
 
 class Tuner:
-    def __init__(self, cfg: TrainConfig, start_params: dict, seed: int | None = None) -> None:
+    def __init__(self, cfg: TrainConfig, start_params: dict, seed: int | None = None,
+                 version: int = 1) -> None:
         self.cfg = cfg
         self.dir = Path(cfg.state_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -117,9 +162,19 @@ class Tuner:
             "candidate": None, "candidate_scores": [],
             "sigma": cfg.sigma_start, "episodes": 0, "accepted": 0, "rejected": 0,
             "best_length": 0, "best_rank": None, "current_role": "incumbent",
+            "version": version, "lengths": [],
         }
+        self.notice = ""
         if self.state_path.exists():
             self.state.update(json.loads(self.state_path.read_text(encoding="utf-8")))
+            if self.state.get("version") != version:
+                # the bot itself changed: old scores say nothing about the new behaviour,
+                # so start a fresh baseline from the new profile (history stays in the CSV)
+                self.state.update(incumbent=start, incumbent_scores=[], candidate=None,
+                                  candidate_scores=[], sigma=cfg.sigma_start, version=version,
+                                  lengths=[], current_role="incumbent")
+                self.notice = (f"[train] new bot version {version}: tuning starts a fresh baseline "
+                               "from the new profile (old rounds stay in episodes.csv)")
             # parameters added in a newer version: start them at the current defaults
             for role in ("incumbent", "candidate"):
                 if self.state[role] is not None:
@@ -160,12 +215,33 @@ class Tuner:
         else:
             s["candidate_scores"].append(score)
             verdict = self._judge()
+        s["lengths"] = (s.get("lengths", []) + [length])[-500:]
         self._save()
         rank = f"{ep.best_rank}/{ep.players}" if ep.best_rank else "?"
         return (f"[train] round {s['episodes']} ({role}) length={length or '?'} rank={rank} "
                 f"time={ep.duration_s / 60:.1f}min score={score:.2f} | incumbent mean="
                 f"{_mean(s['incumbent_scores']):.2f} sigma={s['sigma']:.3f} "
-                f"best length={s['best_length']} best rank={s['best_rank']} {verdict}")
+                f"best length={s['best_length']} best rank={s['best_rank']} {verdict}\n"
+                f"        {behaviour_line(ep.modes)}\n        {self.trend_line()}")
+
+    def trend_line(self) -> str:
+        """Is it getting better? Median of the last 10 rounds vs. the 10 before and the start."""
+        ls = [x for x in self.state.get("lengths", []) if x]
+        if len(ls) < 6:
+            return f"Lernkurve: noch zu wenig Runden ({len(ls)}), ab ~20 wird es aussagekräftig"
+
+        def med(xs):
+            xs = sorted(xs)
+            return xs[len(xs) // 2]
+        recent, first = ls[-10:], ls[:10]
+        line = f"Lernkurve: Median letzte {len(recent)} Runden = {med(recent)}, erste {len(first)} = {med(first)}"
+        if len(ls) >= 20:
+            change = 100 * (med(recent) / max(med(first), 1) - 1)
+            line += f" ({change:+.0f}%)"
+        return line + f", {self.state['accepted']} Verbesserungen übernommen"
+
+    def describe(self, role: str) -> str:
+        return f"[train] {role}: {style_line(self.state[role] or self.state['incumbent'])}"
 
     @property
     def incumbent(self) -> dict:
