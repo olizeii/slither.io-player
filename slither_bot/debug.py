@@ -40,6 +40,15 @@ def render(frame: np.ndarray, state: GameState, action: Action | None = None,
             p = (int(cx + tr.x), int(cy + tr.y))
             cv2.circle(img, p, int(max(tr.radius, 4) * 2), (0, 255, 255), 2)
             cv2.arrowedLine(img, p, (int(p[0] + tr.vx * 0.3), int(p[1] + tr.vy * 0.3)), (0, 255, 255), 2)
+        for z in dbg.get("zones", []):           # loot zones: magenta = confirmed, grey = pending
+            color = (255, 0, 255) if z.confirmed else (160, 160, 160)
+            cv2.circle(img, (int(cx + z.x), int(cy + z.y)), 40, color, 2)
+            cv2.putText(img, f"{z.source} {z.mass:.0f}", (int(cx + z.x) - 30, int(cy + z.y) - 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        if state.crowd_angle is not None:          # minimap crowd direction: orange arrow
+            a = state.crowd_angle
+            cv2.arrowedLine(img, (int(cx), int(cy)), (int(cx + 90 * math.cos(a)), int(cy + 90 * math.sin(a))),
+                            (0, 165, 255), 2, tipLength=0.25)
         h = dbg.get("heading")
         if h is not None:
             cv2.line(img, (int(cx), int(cy)),

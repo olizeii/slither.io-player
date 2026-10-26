@@ -30,6 +30,7 @@ from .config import AGGRESSIVE, BotConfig, apply_brain_params, load_config
 from .controller import MouseController
 from .episode import EpisodeTracker
 from .hud import HudReader
+from .minimap import analyze_minimap, apply_minimap
 from .tuner import SPACE, Tuner
 from .vision import GameState, Vision
 
@@ -168,7 +169,10 @@ def run(cfg: BotConfig, train: bool = False) -> None:
     print(f"[init] game region {w}x{h} at ({left},{top})")
 
     buffer = LatestFrameBuffer()
-    hud_rects = {"stats": cfg.hud.stats_rect, "final": cfg.hud.final_rect} if cfg.hud.enabled else None
+    # full-resolution crops for OCR and the minimap population map
+    hud_rects = {"minimap": cfg.vision.minimap_rect}
+    if cfg.hud.enabled:
+        hud_rects.update(stats=cfg.hud.stats_rect, final=cfg.hud.final_rect)
     capture = ScreenCapture(region, cfg.capture, buffer, hud_rects, cfg.hud.interval_s)
     print(f"[init] capture backend: {capture.backend}, analysis size {capture.out_size}")
     hud = HudReader(buffer, cfg.hud)
@@ -201,6 +205,8 @@ def run(cfg: BotConfig, train: bool = False) -> None:
     controller.start()
     last_id = 0
     frame_no = 0
+    minimap_info = None
+    minimap_ts = 0.0
     try:
         while True:
             frame = buffer.wait_newer(last_id, timeout=0.5)
@@ -223,6 +229,11 @@ def run(cfg: BotConfig, train: bool = False) -> None:
 
             t0 = time.perf_counter()
             state = vision.analyze(frame.image, frame.timestamp)
+            crops = buffer.latest_hud()
+            if crops is not None and crops[0] != minimap_ts:     # new minimap crop (2 Hz)
+                minimap_ts = crops[0]
+                minimap_info = analyze_minimap(crops[1].get("minimap"), cfg.vision, minimap_ts)
+            apply_minimap(state, minimap_info, t0)
             action = brain.decide(state)
             t1 = time.perf_counter()
 

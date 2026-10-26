@@ -46,11 +46,13 @@ class HeadTracker:
         self.max_age = max_age
         self.alpha = vel_alpha
         self.tracks: dict[int, Track] = {}
+        self.lost: list[Track] = []
         self._ids = itertools.count(1)
         self._t: float | None = None
 
     def reset(self) -> None:
         self.tracks.clear()
+        self.lost = []
         self._t = None
 
     def update(self, heads: list[EnemyHead], t: float, cx: float, cy: float) -> list[Track]:
@@ -94,6 +96,7 @@ class HeadTracker:
                 tid = next(self._ids)
                 self.tracks[tid] = Track(tid, x, y, r, t)
 
-        for tid in [tid for tid, tr in self.tracks.items() if t - tr.last_seen > self.max_age]:
-            del self.tracks[tid]
+        # tracks dropped this frame (at their last *measured* position) -> death candidates
+        self.lost = [self.tracks.pop(tid) for tid in
+                     [tid for tid, tr in self.tracks.items() if t - tr.last_seen > self.max_age]]
         return list(self.tracks.values())

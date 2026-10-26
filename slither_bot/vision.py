@@ -50,6 +50,14 @@ class GameState:
     border_angle: float | None = None          # direction from us towards the nearest border
     border_proximity: float = 0.0              # 0 = world centre, 1 = on the border
     menu_button: tuple[float, float] | None = None   # start/death menu visible -> button centre
+    # obstacle points/blobs of snake-like components without eyes: either a body
+    # whose head is elsewhere, or merged loot orbs of a dead snake
+    obstacle_eyeless: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
+    eyeless_blobs: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.float32))  # x, y, area
+    # population map on the minimap: where the crowded areas are
+    crowd_angle: float | None = None
+    crowd_dist: float = 0.0                    # minimap radii
+    crowd_mass: float = 0.0
     debug: dict = field(default_factory=dict)
 
     @property
@@ -63,6 +71,8 @@ class Vision:
         self._lit_lo, self._lit_hi = _u8(cfg.lit_lower), _u8(cfg.lit_upper)
         self._white_lo, self._white_hi = _u8(cfg.white_lower), _u8(cfg.white_upper)
         self._eye_lo, self._eye_hi = _u8(cfg.eye_lower), _u8(cfg.eye_upper)
+        self._eye_is_white = (tuple(cfg.eye_lower) == tuple(cfg.white_lower)
+                              and tuple(cfg.eye_upper) == tuple(cfg.white_upper))
         self._b1_lo, self._b1_hi = _u8(cfg.border_lower1), _u8(cfg.border_upper1)
         self._b2_lo, self._b2_hi = _u8(cfg.border_lower2), _u8(cfg.border_upper2)
         self._dot_lo, self._dot_hi = _u8(cfg.minimap_dot_lower), _u8(cfg.minimap_dot_upper)
@@ -100,8 +110,10 @@ class Vision:
 
         # 1) colour thresholding ------------------------------------------------
         lit = cv2.inRange(hsv, self._lit_lo, self._lit_hi)
-        lit = cv2.bitwise_or(lit, cv2.inRange(hsv, self._white_lo, self._white_hi))
+        white = cv2.bitwise_and(cv2.inRange(hsv, self._white_lo, self._white_hi), play)
+        lit = cv2.bitwise_or(lit, white)
         lit = cv2.bitwise_and(lit, play)
+        eye = white if self._eye_is_white else cv2.bitwise_and(cv2.inRange(hsv, self._eye_lo, self._eye_hi), play)
         if self._close is not None:
             lit = cv2.morphologyEx(lit, cv2.MORPH_CLOSE, self._close)
 
@@ -115,48 +127,77 @@ class Vision:
         aspect = np.maximum(bw, bh) / np.maximum(np.minimum(bw, bh), 1.0)
 
         small_food = (area >= c.food_min_area) & (area <= c.food_max_area)
-        big_food = ((area > c.food_max_area) & (area <= c.big_food_max_area)
-                    & (fill >= c.big_food_min_fill) & (aspect <= c.big_food_max_aspect))
-        snake = (area > c.food_max_area) & ~big_food
-        for arr in (small_food, big_food, snake):
+        large = area > c.food_max_area
+        for arr in (small_food, large):
             arr[0] = False                       # label 0 = background
             if self_label:
                 arr[self_label] = False
+
+        # heads first: a blob with eyes is always a snake, never loot
+        large_mask = np.where(large, 255, 0).astype(np.uint8)[labels]
+        heads, eyed_labels = self._find_heads(hsv, eye, large_mask, labels, area)
+        eyed = np.zeros(n, bool)
+        eyed[list(eyed_labels)] = True
+
+        # loot orbs (remains of dead snakes): big, round, no eyes, fully on screen.
+        # Blobs touching the frame edge may be a snake body whose head is outside.
+        x0s, y0s = stats[:, cv2.CC_STAT_LEFT], stats[:, cv2.CC_STAT_TOP]
+        on_screen = (x0s > 1) & (y0s > 1) & (x0s + bw < w - 1) & (y0s + bh < h - 1)
+        big_food = (large & ~eyed & on_screen & (area <= c.big_food_max_area)
+                    & (fill >= c.big_food_min_fill) & (aspect <= c.big_food_max_aspect))
+        snake = large & ~big_food
 
         food_idx = np.flatnonzero(small_food | big_food)
         weights = area[food_idx] * np.where(big_food[food_idx], c.big_food_weight, 1.0)
         food = np.column_stack([centroids[food_idx], weights]).astype(np.float32)
 
-        # obstacle mask via lookup table: one fancy-index op instead of a loop
-        lut = np.where(snake, 255, 0).astype(np.uint8)
-        obstacle = lut[labels]
-
-        # 3) world border (dark red area outside the map) ----------------------
-        border = cv2.bitwise_or(cv2.inRange(hsv, self._b1_lo, self._b1_hi),
-                                cv2.inRange(hsv, self._b2_lo, self._b2_hi))
-        border = cv2.bitwise_and(border, play)
-        border_visible = cv2.countNonZero(border) >= c.border_min_area
-        if border_visible:
-            obstacle = cv2.bitwise_or(obstacle, border)
+        # obstacle mask = large blobs minus the few loot orbs (cheap: only their boxes)
+        obstacle = large_mask
+        for i in np.flatnonzero(big_food):
+            x, y, bwi, bhi = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3]
+            box = obstacle[y:y + bhi, x:x + bwi]
+            box[labels[y:y + bhi, x:x + bwi] == i] = 0
+        eyeless_idx = np.flatnonzero(snake & ~eyed)
+        eyeless_blobs = np.column_stack([centroids[eyeless_idx], area[eyeless_idx]]).astype(np.float32)
 
         # only the outline matters for distance queries -> far fewer points
         outline = cv2.subtract(obstacle, cv2.erode(obstacle, self._k3))
-        ys, xs = np.nonzero(outline)
-        if xs.size > c.max_obstacle_points:
-            step = math.ceil(xs.size / c.max_obstacle_points)
-            xs, ys = xs[::step], ys[::step]
-        obstacles = np.column_stack([xs, ys]).astype(np.float32)
+        pts = cv2.findNonZero(outline)
+        pts = np.zeros((0, 2), np.int32) if pts is None else pts.reshape(-1, 2)
+        if len(pts) > c.max_obstacle_points:
+            pts = pts[::math.ceil(len(pts) / c.max_obstacle_points)]
+        xs, ys = pts[:, 0], pts[:, 1]
+        obstacle_eyeless = (snake & ~eyed)[labels[ys, xs]]
 
-        menu_button = self._find_menu(hsv)
+        # 3) world border (dark red area outside the map), at half resolution --
+        small = cv2.resize(hsv, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST)
+        border = cv2.bitwise_or(cv2.inRange(small, self._b1_lo, self._b1_hi),
+                                cv2.inRange(small, self._b2_lo, self._b2_hi))
+        border = cv2.bitwise_and(border, cv2.resize(play, (w // 2, h // 2), interpolation=cv2.INTER_NEAREST))
+        border_visible = cv2.countNonZero(border) * 4 >= c.border_min_area
+        if border_visible:
+            bpts = cv2.findNonZero(cv2.subtract(border, cv2.erode(border, self._k3)))
+            if bpts is not None:
+                bpts = bpts.reshape(-1, 2) * 2
+                pts = np.concatenate([pts, bpts])
+                obstacle_eyeless = np.concatenate([obstacle_eyeless, np.zeros(len(bpts), bool)])
+        obstacles = pts.astype(np.float32)
+
+        self_found = bool(self_label) and area[self_label] >= c.min_self_area
+        # the menu never shows while our snake is on screen: skip that check when playing
+        menu_button = None if self_found else self._find_menu(hsv)
         state = GameState(
             timestamp=timestamp, width=w, height=h,
-            alive=bool(self_label) and area[self_label] >= c.min_self_area and menu_button is None,
+            alive=self_found and menu_button is None,
             food=food, obstacles=obstacles, menu_button=menu_button,
+            obstacle_eyeless=obstacle_eyeless, eyeless_blobs=eyeless_blobs,
         )
         if state.alive:
             state.self_area = int(area[self_label])
             self._analyze_self(state, labels, self_label, cx, cy)
-        state.heads = self._find_heads(hsv, play, obstacle, cx, cy, state.self_radius)
+        # own eyes are excluded by label already; this drops leftovers near the centre
+        exclusion = max(c.self_eye_exclusion, 3.0 * state.self_radius)
+        state.heads = [hd for hd in heads if math.hypot(hd.x - cx, hd.y - cy) >= exclusion]
         if c.minimap_enabled:
             self._read_minimap(state, hsv)
 
@@ -191,28 +232,30 @@ class Vision:
             state.self_heading = math.atan2(-dy[ring].mean(), -dx[ring].mean())
 
     # ------------------------------------------------------------------ enemy heads
-    def _find_heads(self, hsv: np.ndarray, play: np.ndarray, obstacle: np.ndarray,
-                    cx: int, cy: int, self_radius: float) -> list[EnemyHead]:
+    def _find_heads(self, hsv: np.ndarray, eye: np.ndarray, obstacle: np.ndarray,
+                    labels: np.ndarray, area: np.ndarray) -> tuple[list[EnemyHead], set[int]]:
+        """Enemy heads from eye pairs, plus the component labels that carry eyes."""
         c = self.cfg
-        eye = cv2.bitwise_and(cv2.inRange(hsv, self._eye_lo, self._eye_hi), play)
+        # eyes can only sit on large blobs: masking first keeps the labelling cheap
+        eye = cv2.bitwise_and(eye, obstacle)
         m, _, stats, cents = cv2.connectedComponentsWithStats(eye, connectivity=8)
         if m <= 1:
-            return []
+            return [], set()
         a = stats[:, cv2.CC_STAT_AREA]
         valid = np.flatnonzero((a >= c.eye_min_area) & (a <= c.eye_max_area))
         valid = valid[valid > 0]
-        exclusion = max(c.self_eye_exclusion, 3.0 * self_radius)
         h, w = obstacle.shape
         value = hsv[:, :, 2]
 
         eyes: list[tuple[float, float]] = []
+        eye_labels: list[int] = []
         for i in valid:
             ex, ey = cents[i]
-            if math.hypot(ex - cx, ey - cy) < exclusion:
-                continue
             xi, yi = int(ex), int(ey)
-            if not obstacle[max(yi - 3, 0):yi + 4, max(xi - 3, 0):xi + 4].any():
-                continue                          # white food etc., not on a snake
+            win = obstacle[max(yi - 3, 0):yi + 4, max(xi - 3, 0):xi + 4]
+            if not win.any():
+                continue                          # white food, own eyes etc., not on a snake
+            lab = labels[max(yi - 3, 0):yi + 4, max(xi - 3, 0):xi + 4][win > 0]
             # the pupil sits in or right next to the white; it must lie inside the
             # (hole-filled) snake body, otherwise it is just dark background
             x = max(stats[i, cv2.CC_STAT_LEFT] - 3, 0)
@@ -224,8 +267,10 @@ class Vision:
             if pupil < c.eye_min_pupil_px:
                 continue                          # white skin patch, no pupil
             eyes.append((float(ex), float(ey)))
+            eye_labels.append(int(np.bincount(lab).argmax()))
 
         heads: list[EnemyHead] = []
+        eyed: set[int] = set()
         used = [False] * len(eyes)
         for i, (ex, ey) in enumerate(eyes):
             if used[i]:
@@ -238,6 +283,11 @@ class Vision:
                 used[j] = True
             if len(group) > 2:
                 continue                          # stripes of a white skin, not eyes
+            if c.eye_require_pair and (len(group) != 2 or eye_labels[group[0]] != eye_labels[group[1]]):
+                continue                          # glowing food has one bright core, heads two eyes
+            if area[eye_labels[group[0]]] < c.eye_min_body_area:
+                continue
+            eyed.update(eye_labels[j] for j in group)
             hx = sum(eyes[j][0] for j in group) / len(group)
             hy = sum(eyes[j][1] for j in group) / len(group)
             r = int(c.eye_pair_max_dist)
@@ -245,7 +295,7 @@ class Vision:
             roi = obstacle[max(yi - r, 0):min(yi + r + 1, h), max(xi - r, 0):min(xi + r + 1, w)]
             dist = cv2.distanceTransform((roi > 0).astype(np.uint8), cv2.DIST_L2, 3)
             heads.append(EnemyHead(hx, hy, float(dist.max()) if dist.size else 0.0))
-        return heads
+        return heads, eyed
 
     # ------------------------------------------------------------------ menu
     def _find_menu(self, hsv: np.ndarray) -> tuple[float, float] | None:

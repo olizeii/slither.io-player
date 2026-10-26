@@ -72,6 +72,10 @@ SPACE = [
     Param("encircle_size_ratio", 0.3, 1.2),
     Param("hunt_radius", 150.0, 600.0),
     Param("hunt_offset", 40.0, 200.0, log=True),
+    Param("loot_max_dist", 250.0, 700.0),
+    Param("loot_boost_dist", 40.0, 400.0, log=True),
+    Param("pit_min_mass", 150.0, 1500.0, log=True),
+    Param("w_crowd", 0.0, 1.2),
 ]
 
 
@@ -116,6 +120,11 @@ class Tuner:
         }
         if self.state_path.exists():
             self.state.update(json.loads(self.state_path.read_text(encoding="utf-8")))
+            # parameters added in a newer version: start them at the current defaults
+            for role in ("incumbent", "candidate"):
+                if self.state[role] is not None:
+                    for k, v in start.items():
+                        self.state[role].setdefault(k, v)
 
     # ------------------------------------------------------------ public api
     def next_params(self) -> tuple[str, dict]:

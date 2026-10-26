@@ -87,6 +87,8 @@ class HudReader(threading.Thread):
                 continue
             ts, crops = hud
             last_ts = ts
+            if "stats" not in crops:
+                continue
             try:
                 length, rank, players = parse_stats(self._ocr(crops["stats"]), self.cfg)
                 final = parse_final(self._ocr(crops["final"]), self.cfg)

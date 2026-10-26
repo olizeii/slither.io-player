@@ -33,14 +33,14 @@ class VisionConfig:
     # *lights up* (food, snakes) is bright, so V is the main separator.
     lit_lower: tuple = (0, 70, 90)        # coloured, glowing pixels
     lit_upper: tuple = (179, 255, 255)
-    white_lower: tuple = (0, 0, 200)      # white/grey skins, eyes, white food
-    white_upper: tuple = (179, 60, 255)
+    white_lower: tuple = (0, 0, 190)      # white/grey skins, eyes, white food
+    white_upper: tuple = (179, 70, 255)   # same as the eye range -> one mask serves both
     close_kernel: int = 3                 # morphological close: merges striped skins
 
     # --- component classification (areas in analysis px) ----------------------
     food_min_area: int = 2
     food_max_area: int = 90               # normal food pellets
-    big_food_max_area: int = 450          # remains of dead snakes are bigger ...
+    big_food_max_area: int = 1500         # remains of dead snakes are bigger (and have no eyes) ...
     big_food_min_fill: float = 0.55       # ... but still round (area / bbox area)
     big_food_max_aspect: float = 1.6
     big_food_weight: float = 1.5          # weight multiplier for big pellets
@@ -58,6 +58,8 @@ class VisionConfig:
     eye_pupil_max_v: int = 70
     eye_min_pupil_px: int = 1
     eye_pair_max_dist: float = 25.0
+    eye_require_pair: bool = True         # real frames: glowing food mimics a single eye
+    eye_min_body_area: int = 250
     self_eye_exclusion: float = 25.0
 
     # --- world border: dark red zone outside the map --------------------------
@@ -68,12 +70,22 @@ class VisionConfig:
     border_min_area: int = 1500
 
     # --- minimap (bottom right) gives the position inside the circular world --
-    # measured on a real 1920x1080 frame: circle centre (0.95, 0.911)
+    # rect = the game's 136x136 minimap canvases, measured in the page at 1920x1080
     minimap_enabled: bool = True
-    minimap_rect: tuple = (0.912, 0.846, 0.988, 0.976)  # relative x0, y0, x1, y1
+    minimap_rect: tuple = (0.9146, 0.8481, 0.9854, 0.9741)  # relative x0, y0, x1, y1
     minimap_radius_frac: float = 0.95
-    minimap_dot_lower: tuple = (0, 0, 190)
+    minimap_dot_lower: tuple = (0, 0, 190)               # low-res fallback in Vision
     minimap_dot_upper: tuple = (179, 90, 255)
+    # full-resolution analysis (minimap.py): own marker is pure white ...
+    minimap_self_min_v: int = 225
+    minimap_self_max_s: int = 40
+    # ... the population map is mid-grey
+    crowd_min_v: int = 85
+    crowd_max_s: int = 60
+    crowd_min_pixels: int = 15
+    crowd_self_exclusion: float = 0.08    # map radii around us (our own snake is on the map too)
+    crowd_sigma: float = 0.08             # blur, map radii
+    crowd_decay: float = 0.5              # closer crowds are preferred, map radii
 
     # --- start / death menu: green "Spielen"/"Play Again" button under the
     # purple nickname box (colours taken from the page's CSS) ---------------
@@ -158,6 +170,29 @@ class BrainConfig:
     encircle_shrink_px_s: float = 25.0
     encircle_gain: float = 1.5
     encircle_max_s: float = 8.0
+
+    # LOOT: a snake dies in view (our kill or anyone's) -> rush to its remains
+    loot_enabled: bool = True
+    death_min_hits: int = 6               # head must have been tracked stably before vanishing
+    death_edge_margin: float = 40.0       # vanishing near the screen edge = left the view, not died
+    death_confirm_mass: float = 120.0     # loot mass that must appear where it vanished ...
+    death_confirm_s: float = 1.0          # ... within this time
+    loot_radius: float = 110.0            # zone around the remains; eyeless blobs inside = loot
+    loot_zone_s: float = 8.0
+    loot_max_dist: float = 600.0
+    loot_boost_dist: float = 120.0
+    loot_min_mass: float = 40.0           # zone is eaten up below this
+    loot_item_min_weight: float = 60.0    # food weight that counts as a dead-snake orb
+    # PIT: big accumulations of food anywhere in view (several dead snakes, big kills)
+    pit_enabled: bool = True
+    pit_cell: float = 70.0
+    pit_min_mass: float = 900.0           # normal food clusters reach ~400, dead snakes far more
+    pit_density_ratio: float = 6.0        # ... and must be this much denser than the frame average
+                                          # (a real frame without kills peaked at ~4x)
+    pit_compete_ratio: float = 0.7        # skip if an enemy head is this much closer than us
+    # minimap crowd: drift towards populated areas (more kills, more loot)
+    w_crowd: float = 0.35
+    crowd_min_mass: float = 20.0
 
     # HUNT: shadow a smaller snake alongside its path until a CUTOFF is possible
     hunt_enabled: bool = False

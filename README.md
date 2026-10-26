@@ -48,6 +48,7 @@ Ein Computer-Vision-Bot für [slither.io](http://slither.io). Er liest nur den B
 | Debug | `slither_bot/debug.py` | Overlay: Masken, Strahlen, Köpfe, gewählte Richtung |
 | HUD | `slither_bot/hud.py` | Windows-OCR: Länge, Rang, endgültige Länge |
 | Episode | `slither_bot/episode.py` | erkennt Rundenstart und -ende, sammelt Statistiken |
+| Minimap | `slither_bot/minimap.py` | eigene Position + Richtung zum nächsten dichten Gebiet |
 | Tuner | `slither_bot/tuner.py` | (1+1)-ES: lernt die Parameter zwischen den Runden |
 | Main | `slither_bot/main.py` | verbindet alles, Main-Loop, Respawn, Training, Statistik |
 | Kalibrierung | `tools/calibrate.py` | HSV-Schwellwerte live per Trackbar einstellen |
@@ -173,6 +174,15 @@ Sektoren mit clearance < 35 px sind verboten.
 | 3 | `CUTOFF` | Gegnerkopf seitlich, nicht dicker als wir, wir erreichen mit Boost einen Punkt vor ihm schneller als er | Boost zum Abfangpunkt, danach Kurs halten: der eigene Körper wird zur Wand |
 | 3 | `ENCIRCLE` | wir sind groß (Fläche ≥ 6000), Beute ≤ 0,6× unser Radius in < 260 px | Kreisbahn um den Kopf mit schrumpfendem Radius |
 | 3 | `HUNT` | nur im aggressiven Profil: kleinere Schlange in < 420 px | parallel neben ihrem Weg mitfahren, bis ein `CUTOFF` möglich ist |
+| 1½ | `LOOT` | eine Schlange stirbt im Bild (eigener Kill oder fremder) **oder** ein großer Futterhaufen | sofort hin, mit Boost bei > 120 px; Vorrang vor allen Taktiken, nur Überleben ist wichtiger |
+
+### Loot, Pits und Minimap
+
+- **Tod erkennen:** Ein stabil verfolgter Kopf verschwindet mitten im Bild, nicht am Rand. Bestätigt wird der Tod erst, wenn dort innerhalb 1 s Überreste auftauchen (große Kugeln oder augenlose Blobs). Verschwindet ein Kopf ohne Überreste, passiert nichts.
+- **Überreste statt Wand:** Runde, augenlose Blobs gelten als Futter. Ein Blob mit zwei Augen ist immer eine Schlange. Mehrere verschmolzene Kugeln sehen aus wie ein Körper ohne Kopf. In einer bestätigten Loot-Zone werden solche augenlosen Blobs für 8 s zu Futter statt zu Hindernissen.
+- **Mitbewegung:** Die Zone wird mit der eigenen Bewegung mitgeführt (die Kamera folgt uns) und jeden Frame auf die tatsächlich sichtbaren Überreste nachzentriert.
+- **Pits:** Ein Raster über das ganze Bild sucht den dichtesten Futterhaufen. Er zählt nur, wenn er mindestens 900 Masse hat **und** 6× dichter ist als der Bilddurchschnitt. Ein echtes Bild ohne Kills kam auf etwa 4×. Ist eine Gegnerschlange deutlich näher dran, lässt der Bot ihn aus.
+- **Minimap = Bevölkerungskarte:** Das habe ich direkt aus den Canvas-Elementen der Seite ausgelesen. slither.io zeichnet dort weiße Pixel mit ~42 % Deckkraft, wo Schlangen sind, und die eigene Position als rein weißen Punkt. `minimap.py` sucht auf der Vollauflösung das nächstgelegene dichte Gebiet. Beim Futtersuchen zieht `w_crowd` den Bot dorthin, denn dort gibt es Kills und Loot. Im Debug-Fenster zeigt der orange Pfeil die Richtung, die magenta Kreise sind Loot-Zonen.
 
 Jede Taktik prüft in jedem Frame, ob ihre Richtung sicher ist, und bricht sonst sofort ab. Überleben hat immer Vorrang.
 
@@ -191,7 +201,7 @@ So läuft es ab:
 1. **Aggressiver Start.** Das Profil `AGGRESSIVE` in `config.py` senkt die Angst (`w_danger`, Gefahrenradius, Sicherheitsabstand), boostet früher und schaltet `HUNT` ein. Außerdem greift der Bot auch etwas dickere Schlangen an (`cutoff_size_ratio` 1,6).
 2. **Automatischer Neustart.** Der Bot erkennt das Menü am grünen „Spielen“/„Play Again“-Button unter dem lila Namensfeld (Farben aus dem CSS der Seite) und klickt ihn.
 3. **Echte Punktzahl per OCR.** Die eingebaute Windows-Texterkennung (`winocr`, Sprache `de`) liest während der Runde „Deine Länge“ und „Dein rang: X von Y“. Nach dem Tod liest sie „Deine endgültige Länge war N“. Score einer Runde = log(Länge).
-4. **Lernen zwischen den Runden.** Der Tuner (`tuner.py`) ist eine rauschfeste (1+1)-Evolutionsstrategie über 19 Parameter (Angst, Gier, Boost, Cutoff, Einkreisen, Jagen):
+4. **Lernen zwischen den Runden.** Der Tuner (`tuner.py`) ist eine rauschfeste (1+1)-Evolutionsstrategie über 23 Parameter (Angst, Gier, Boost, Cutoff, Einkreisen, Jagen, Loot, Crowd):
    - Der *Incumbent* ist der beste Parametersatz bisher. Ein *Kandidat* ist eine Mutation davon und spielt 3 Runden.
    - Der Kandidat ersetzt den Incumbent nur, wenn sein mittlerer Score besser ist. Eine katastrophale erste Runde (Länge < 35 % des Medians) verwirft ihn sofort.
    - Jede 4. Runde spielt wieder der Incumbent. So kann ein Glückstreffer nicht ewig oben bleiben.
