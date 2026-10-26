@@ -45,6 +45,7 @@ class Mode(str, enum.Enum):
     ESCAPE = "escape"
     CUTOFF = "cutoff"
     ENCIRCLE = "encircle"
+    HUNT = "hunt"
 
 
 @dataclass
@@ -276,6 +277,30 @@ class Brain:
 
     def _find_maneuver(self, s, tracks, cx, cy, margin, t) -> _Maneuver | None:
         cfg = self.cfg
+        cut = self._find_cutoff(s, tracks, cx, cy, margin, t)
+        if cut is not None:
+            return cut
+
+        if cfg.encircle_enabled and s.self_area >= cfg.encircle_min_self_area:
+            prey = [tr for tr in tracks if tr.dist <= cfg.encircle_start_dist
+                    and tr.radius <= s.self_radius * cfg.encircle_size_ratio]
+            if prey:
+                tr = min(prey, key=lambda x: x.dist)
+                radial = np.array([tr.x, tr.y]) / max(tr.dist, 1e-6)
+                perp = np.array([-radial[1], radial[0]])
+                heading_vec = np.array([math.cos(self.heading), math.sin(self.heading)])
+                sign = 1.0 if float(np.dot(perp, heading_vec)) >= 0 else -1.0
+                return _Maneuver(Mode.ENCIRCLE, tr.id, t, orbit_sign=sign)
+
+        if cfg.hunt_enabled:
+            prey = [tr for tr in tracks if tr.dist <= cfg.hunt_radius
+                    and tr.radius <= s.self_radius * cfg.hunt_size_ratio]
+            if prey:
+                return _Maneuver(Mode.HUNT, min(prey, key=lambda x: x.dist).id, t)
+        return None
+
+    def _find_cutoff(self, s, tracks, cx, cy, margin, t) -> _Maneuver | None:
+        cfg = self.cfg
         if cfg.cutoff_enabled and s.self_area >= cfg.boost_min_self_area:
             best = None
             for tr in tracks:
@@ -302,17 +327,6 @@ class Brain:
                     break
             if best is not None:
                 return _Maneuver(Mode.CUTOFF, best[1], t, lead=best[2])
-
-        if cfg.encircle_enabled and s.self_area >= cfg.encircle_min_self_area:
-            prey = [tr for tr in tracks if tr.dist <= cfg.encircle_start_dist
-                    and tr.radius <= s.self_radius * cfg.encircle_size_ratio]
-            if prey:
-                tr = min(prey, key=lambda x: x.dist)
-                radial = np.array([tr.x, tr.y]) / max(tr.dist, 1e-6)
-                perp = np.array([-radial[1], radial[0]])
-                heading_vec = np.array([math.cos(self.heading), math.sin(self.heading)])
-                sign = 1.0 if float(np.dot(perp, heading_vec)) >= 0 else -1.0
-                return _Maneuver(Mode.ENCIRCLE, tr.id, t, orbit_sign=sign)
         return None
 
     def _run_maneuver(self, s, tracks, cx, cy, margin, t, can_boost):
@@ -362,5 +376,30 @@ class Brain:
                 self.maneuver = None
                 return None
             return angle, can_boost and tr.dist > 1.4 * orbit   # prey is escaping the ring
+
+        if m.mode is Mode.HUNT:
+            if tr is None or t - m.started > cfg.hunt_max_s or tr.dist > 1.3 * cfg.hunt_radius:
+                self.maneuver = None
+                return None
+            cut = self._find_cutoff(s, tracks, cx, cy, margin, t)
+            if cut is not None:                   # in position: strike
+                self.maneuver = cut
+                return self._run_maneuver(s, tracks, cx, cy, margin, t, can_boost)
+            ve = np.array([tr.vx, tr.vy]) + self._our_velocity()
+            speed = float(np.hypot(*ve))
+            if speed < 1e-6:
+                self.maneuver = None
+                return None
+            vhat = ve / speed
+            perp = np.array([-vhat[1], vhat[0]])
+            e = np.array([tr.x, tr.y])
+            side = 1.0 if float(np.dot(perp, -e)) >= 0 else -1.0   # stay on our side of its path
+            target = e + vhat * cfg.hunt_lead + side * perp * cfg.hunt_offset
+            dist = float(np.hypot(*target))
+            angle = math.atan2(target[1], target[0])
+            if not self._safe(p, angle, min(dist, 150.0)):
+                self.maneuver = None
+                return None
+            return angle, can_boost and dist > 2.5 * cfg.hunt_offset
         self.maneuver = None
         return None

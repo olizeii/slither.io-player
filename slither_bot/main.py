@@ -2,18 +2,23 @@
 
 Threads:
   capture  grab + downscale, publishes the newest frame (drops stale ones)
-  main     vision + brain + hotkeys + debug window  (~8-12 ms per frame)
+  hud-ocr  reads length / rank / final length with Windows OCR (2 Hz)
+  main     vision + brain + hotkeys + training bookkeeping + debug window
   mouse    rotates the cursor towards the target angle at 240 Hz
 
 Hotkeys (global): F8 start/pause, F9 debug window on/off, F12 quit.
 
-    python -m slither_bot.main --debug
+    python -m slither_bot.main --debug             # play with the default parameters
+    python -m slither_bot.main --train             # play aggressively and self-tune forever
+    python -m slither_bot.main --use-best          # play with the best parameters found so far
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+from pathlib import Path
 
 import cv2
 
@@ -21,9 +26,12 @@ from . import debug as debug_view
 from . import win32
 from .brain import Brain, Mode
 from .capture import LatestFrameBuffer, ScreenCapture
-from .config import BotConfig, load_config
+from .config import AGGRESSIVE, BotConfig, apply_brain_params, load_config
 from .controller import MouseController
-from .vision import Vision
+from .episode import EpisodeTracker
+from .hud import HudReader
+from .tuner import SPACE, Tuner
+from .vision import GameState, Vision
 
 
 def locate_game(cfg: BotConfig) -> tuple[int | None, tuple[int, int, int, int]]:
@@ -47,27 +55,40 @@ def locate_game(cfg: BotConfig) -> tuple[int | None, tuple[int, int, int, int]]:
 
 
 class Respawner:
+    """Clicks the green Play / Play Again button once the menu is visible."""
+
+    FALLBACK_AFTER_S = 8.0       # no button detected but dead this long -> click the default spot
+
     def __init__(self, cfg: BotConfig, region, controller: MouseController) -> None:
         self.cfg = cfg.runtime
         self.region = region
         self.controller = controller
+        self.menu_since: float | None = None
         self.dead_since: float | None = None
         self.last_try = 0.0
 
-    def update(self, alive: bool, now: float) -> None:
-        if alive:
-            self.dead_since = None
+    def update(self, state: GameState, now: float) -> None:
+        left, top, w, h = self.region
+        if state.alive:
+            self.menu_since = self.dead_since = None
             return
-        if self.dead_since is None:
-            self.dead_since = now
+        self.dead_since = self.dead_since or now
+        if now - self.last_try < self.cfg.respawn_retry_s:
             return
-        if now - self.dead_since < self.cfg.respawn_delay_s or now - self.last_try < self.cfg.respawn_retry_s:
+        if state.menu_button is not None:
+            self.menu_since = self.menu_since or now
+            if now - self.menu_since < self.cfg.respawn_delay_s:
+                return
+            bx, by = state.menu_button
+            x, y = left + bx * w / state.width, top + by * h / state.height
+        elif now - self.dead_since > self.FALLBACK_AFTER_S:
+            rx, ry = self.cfg.respawn_click_rel
+            x, y = left + rx * w, top + ry * h
+        else:
             return
         self.last_try = now
-        left, top, w, h = self.region
-        rx, ry = self.cfg.respawn_click_rel
-        print("[respawn] clicking play")
-        self.controller.click_at(left + rx * w, top + ry * h)
+        print(f"[respawn] clicking play at ({x:.0f},{y:.0f})")
+        self.controller.click_at(x, y)
         if self.cfg.respawn_press_enter:
             time.sleep(0.05)
             self.controller.input.enter()
@@ -83,7 +104,7 @@ class Stats:
         self.fps = 0.0
         self.text = ""
 
-    def tick(self, work_s: float, latency_s: float, mode: Mode) -> None:
+    def tick(self, work_s: float, latency_s: float, mode: Mode, extra: str = "") -> None:
         self.frames += 1
         self.work += work_s
         self.latency += latency_s
@@ -92,7 +113,7 @@ class Stats:
             self.fps = self.frames / (now - self.t0)
             self.text = (f"fps={self.fps:5.1f} vision+brain={1000 * self.work / self.frames:5.1f}ms "
                          f"latency={1000 * self.latency / self.frames:5.1f}ms")
-            print(f"[stats] {self.text} mode={mode.value}")
+            print(f"[stats] {self.text} mode={mode.value} {extra}")
             self.t0, self.frames, self.work, self.latency = now, 0, 0.0, 0.0
 
 
@@ -106,6 +127,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--auto-respawn", action="store_true")
     ap.add_argument("--no-foreground-check", action="store_true")
     ap.add_argument("--start", action="store_true", help="start immediately instead of paused")
+    ap.add_argument("--aggressive", action="store_true", help="start from the aggressive profile")
+    ap.add_argument("--train", action="store_true",
+                    help="self-tuning: aggressive start, auto respawn, learns between rounds")
+    ap.add_argument("--use-best", action="store_true", help="play with tuning/best_params.json")
     return ap.parse_args(argv)
 
 
@@ -118,15 +143,24 @@ def build_config(args: argparse.Namespace) -> BotConfig:
     if args.fps:
         cfg.capture.target_fps = args.fps
     cfg.runtime.debug |= args.debug
-    cfg.runtime.auto_respawn |= args.auto_respawn
+    cfg.runtime.auto_respawn |= args.auto_respawn or args.train
     if args.no_foreground_check:
         cfg.runtime.foreground_check = False
     if args.start:
         cfg.runtime.start_paused = False
+    if args.aggressive or args.train:
+        apply_brain_params(cfg, AGGRESSIVE)
+    if args.use_best:
+        best = Path(cfg.train.state_dir) / "best_params.json"
+        if best.exists():
+            apply_brain_params(cfg, json.loads(best.read_text(encoding="utf-8")))
+            print(f"[init] using {best}")
+        else:
+            print(f"[init] {best} not found yet - run --train first")
     return cfg
 
 
-def run(cfg: BotConfig) -> None:
+def run(cfg: BotConfig, train: bool = False) -> None:
     win32.enable_dpi_awareness()
     win32.set_timer_resolution(1)
     hwnd, region = locate_game(cfg)
@@ -134,8 +168,22 @@ def run(cfg: BotConfig) -> None:
     print(f"[init] game region {w}x{h} at ({left},{top})")
 
     buffer = LatestFrameBuffer()
-    capture = ScreenCapture(region, cfg.capture, buffer)
+    hud_rects = {"stats": cfg.hud.stats_rect, "final": cfg.hud.final_rect} if cfg.hud.enabled else None
+    capture = ScreenCapture(region, cfg.capture, buffer, hud_rects, cfg.hud.interval_s)
     print(f"[init] capture backend: {capture.backend}, analysis size {capture.out_size}")
+    hud = HudReader(buffer, cfg.hud)
+    print("[init] HUD OCR: " + ("on" if hud.available else f"off ({hud.error})"))
+
+    tuner = tracker = None
+    role = "-"
+    if train:
+        tuner = Tuner(cfg.train, {p.name: getattr(cfg.brain, p.name) for p in SPACE})
+        role, params = tuner.next_params()
+        apply_brain_params(cfg, params)
+        tracker = EpisodeTracker(hud, cfg.train.final_length_wait_s)
+        print(f"[train] state in {tuner.state_path} - {tuner.state['episodes']} rounds so far, "
+              f"best length {tuner.state['best_length']}, next round plays the {role}")
+
     vision = Vision(cfg.vision)
     brain = Brain(cfg.brain)
     controller = MouseController((left + w / 2.0, top + h / 2.0), cfg.control)
@@ -149,6 +197,7 @@ def run(cfg: BotConfig) -> None:
           + ("  (paused - focus the game and press F8)" if paused else ""))
 
     capture.start()
+    hud.start()
     controller.start()
     last_id = 0
     frame_no = 0
@@ -179,20 +228,34 @@ def run(cfg: BotConfig) -> None:
 
             focused = (not cfg.runtime.foreground_check or hwnd is None
                        or win32.foreground_window() == hwnd)
+            running = not paused and focused
             controller.command(action.angle, action.boost)
-            controller.set_active(not paused and focused and state.alive)
-            if cfg.runtime.auto_respawn and not paused and focused:
-                respawner.update(state.alive, t1)
+            controller.set_active(running and state.alive)
 
-            stats.tick(t1 - t0, t1 - frame.timestamp, action.mode)
+            if tracker is not None and running:
+                episode = tracker.update(state, action, t1)
+                if episode is not None:
+                    print(tuner.report(episode))
+                    role, params = tuner.next_params()
+                    apply_brain_params(cfg, params)
+                    brain = Brain(cfg.brain)          # fresh brain with the next parameter set
+                    print(f"[train] next round: {role}")
+            # never click "Play Again" before the final length has been read
+            if cfg.runtime.auto_respawn and running and (tracker is None or tracker.phase != "ending"):
+                respawner.update(state, t1)
+
+            hv = hud.snapshot()
+            extra = f"len={hv.length} rank={hv.rank}/{hv.players}" if hud.available else ""
+            stats.tick(t1 - t0, t1 - frame.timestamp, action.mode, extra)
             if show_debug and frame_no % cfg.runtime.debug_every == 0:
-                info = stats.text + (" PAUSED" if paused else "")
+                info = stats.text + (" PAUSED" if paused else "") + (f" [{role}]" if train else "")
                 cv2.imshow(debug_view.WINDOW, debug_view.render(frame.image, state, action, info))
                 cv2.waitKey(1)
     except KeyboardInterrupt:
         pass
     finally:
         controller.stop()
+        hud.stop()
         capture.stop()
         cv2.destroyAllWindows()
         win32.reset_timer_resolution(1)
@@ -200,7 +263,8 @@ def run(cfg: BotConfig) -> None:
 
 
 def main(argv=None) -> int:
-    run(build_config(parse_args(argv)))
+    args = parse_args(argv)
+    run(build_config(args), train=args.train)
     return 0
 
 

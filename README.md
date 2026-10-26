@@ -46,7 +46,10 @@ Ein Computer-Vision-Bot für [slither.io](http://slither.io). Er liest nur den B
 | Controller | `slither_bot/controller.py` | Cursor/Boost über Win32-API (pynput als Fallback) |
 | Win32 | `slither_bot/win32.py` | ctypes: DPI-Awareness, Fenstersuche, SendInput, Hotkeys |
 | Debug | `slither_bot/debug.py` | Overlay: Masken, Strahlen, Köpfe, gewählte Richtung |
-| Main | `slither_bot/main.py` | verbindet alles, Main-Loop, Respawn, Statistik |
+| HUD | `slither_bot/hud.py` | Windows-OCR: Länge, Rang, endgültige Länge |
+| Episode | `slither_bot/episode.py` | erkennt Rundenstart und -ende, sammelt Statistiken |
+| Tuner | `slither_bot/tuner.py` | (1+1)-ES: lernt die Parameter zwischen den Runden |
+| Main | `slither_bot/main.py` | verbindet alles, Main-Loop, Respawn, Training, Statistik |
 | Kalibrierung | `tools/calibrate.py` | HSV-Schwellwerte live per Trackbar einstellen |
 
 ---
@@ -84,7 +87,9 @@ Optional für spätere Ausbaustufen: `onnxruntime-directml` oder `ultralytics` f
 
 Sicherheitsnetz: Verliert das Spielfenster den Fokus, lässt der Bot sofort die Maus los (`runtime.foreground_check`). Das Debug-Fenster sollte auf einem zweiten Monitor oder neben der Spielregion liegen, sonst sieht der Bot sich selbst.
 
-Optionen: `--region L,T,W,H`, `--backend mss`, `--fps 60`, `--auto-respawn`, `--start`, `--no-foreground-check`.
+Optionen: `--region L,T,W,H`, `--backend mss`, `--fps 60`, `--auto-respawn`, `--start`, `--no-foreground-check`, `--aggressive`, `--train`, `--use-best`.
+
+Wichtig: Der slither.io-Tab muss der **aktive Tab** seines Fensters sein (Fenstertitel beginnt mit „slither.io“). Am besten ziehst du ihn in ein eigenes Fenster. dxcam nimmt nur den Hauptmonitor auf. Liegt das Spiel auf einem anderen Monitor, nimmt der Bot automatisch das langsamere `mss`.
 
 ### Tests
 
@@ -167,8 +172,45 @@ Sektoren mit clearance < 35 px sind verboten.
 | 2 | `FEAST` | ≥ 250 Futtermasse in < 220 px, sicher, fast geradeaus | Boost, um Überreste vor anderen zu holen |
 | 3 | `CUTOFF` | Gegnerkopf seitlich, nicht dicker als wir, wir erreichen mit Boost einen Punkt vor ihm schneller als er | Boost zum Abfangpunkt, danach Kurs halten: der eigene Körper wird zur Wand |
 | 3 | `ENCIRCLE` | wir sind groß (Fläche ≥ 6000), Beute ≤ 0,6× unser Radius in < 260 px | Kreisbahn um den Kopf mit schrumpfendem Radius |
+| 3 | `HUNT` | nur im aggressiven Profil: kleinere Schlange in < 420 px | parallel neben ihrem Weg mitfahren, bis ein `CUTOFF` möglich ist |
 
 Jede Taktik prüft in jedem Frame, ob ihre Richtung sicher ist, und bricht sonst sofort ab. Überleben hat immer Vorrang.
+
+---
+
+## 4b. Trainingsmodus: aggressiv spielen und sich selbst verbessern
+
+```bash
+train.bat
+```
+
+`train.bat` startet `python -m slither_bot.main --train --start` und startet den Bot neu, falls er abstürzt. F12 beendet ihn endgültig.
+
+So läuft es ab:
+
+1. **Aggressiver Start.** Das Profil `AGGRESSIVE` in `config.py` senkt die Angst (`w_danger`, Gefahrenradius, Sicherheitsabstand), boostet früher und schaltet `HUNT` ein. Außerdem greift der Bot auch etwas dickere Schlangen an (`cutoff_size_ratio` 1,6).
+2. **Automatischer Neustart.** Der Bot erkennt das Menü am grünen „Spielen“/„Play Again“-Button unter dem lila Namensfeld (Farben aus dem CSS der Seite) und klickt ihn.
+3. **Echte Punktzahl per OCR.** Die eingebaute Windows-Texterkennung (`winocr`, Sprache `de`) liest während der Runde „Deine Länge“ und „Dein rang: X von Y“. Nach dem Tod liest sie „Deine endgültige Länge war N“. Score einer Runde = log(Länge).
+4. **Lernen zwischen den Runden.** Der Tuner (`tuner.py`) ist eine rauschfeste (1+1)-Evolutionsstrategie über 19 Parameter (Angst, Gier, Boost, Cutoff, Einkreisen, Jagen):
+   - Der *Incumbent* ist der beste Parametersatz bisher. Ein *Kandidat* ist eine Mutation davon und spielt 3 Runden.
+   - Der Kandidat ersetzt den Incumbent nur, wenn sein mittlerer Score besser ist. Eine katastrophale erste Runde (Länge < 35 % des Medians) verwirft ihn sofort.
+   - Jede 4. Runde spielt wieder der Incumbent. So kann ein Glückstreffer nicht ewig oben bleiben.
+   - Die Schrittweite passt sich an: Sie wächst bei Erfolg und schrumpft bei Misserfolg (1/5-Regel).
+5. **Gedächtnis.** `tuning/state.json` (Lernstand), `tuning/episodes.csv` (jede Runde mit Länge, Rang, Dauer, Zeit pro Modus und Parametern) und `tuning/best_params.json`. Beim nächsten Start lernt der Bot dort weiter, wo er aufgehört hat.
+
+Mit den besten gefundenen Parametern ohne weiteres Lernen spielen:
+
+```bash
+python -m slither_bot.main --use-best
+```
+
+Konsolenausgabe pro Runde, zum Beispiel:
+
+```
+[train] round 17 (candidate) length=1843 rank=4/512 time=9.3min score=7.52 | incumbent mean=6.91 sigma=0.162 best length=2410 best rank=2 candidate 2/3
+```
+
+Ehrliche Erwartung: Eine Runde dauert Minuten, das sind etwa 10–20 Runden pro Stunde. Spürbare Verbesserungen brauchen einige Dutzend Runden, also einen Tag Laufzeit ist realistisch für ein gut getuntes Profil. Platz 1 hängt stark vom Server ab (wie viele große Spieler gerade online sind). In `episodes.csv` siehst du, ob die Kurve steigt.
 
 ---
 
@@ -201,11 +243,12 @@ Ehrlich gesagt: Pixelbasierte Bots kommen auf vollen Servern selten dauerhaft au
 - Er frisst zu zögerlich: `w_food` erhöhen, `food_dist_scale` vergrößern.
 - Futter wird als Schlange erkannt oder umgekehrt: `vision.food_max_area` und `big_food_*` im Debug-Fenster prüfen.
 - Die Minimap-Position stimmt nicht: `vision.minimap_rect` an deine Auflösung anpassen (Debug-Fenster zeigt `border=`).
-- Auto-Respawn: `runtime.respawn_click_rel` auf die Position des „Play“-Buttons setzen, dann mit `--auto-respawn` starten.
+- Auto-Respawn findet den Button selbst. Nur wenn das scheitert, klickt er nach 8 s auf `runtime.respawn_click_rel`.
+- OCR liest nichts: Prüfen, ob `hud.stats_rect` zur Position von „Deine Länge“ passt (unten links, gemessen auf 1920×1080). Bei englischer Windows-OCR `hud.lang` auf `en` setzen.
 
 ## Roadmap
 
 - [ ] YOLO-Detektor als Alternative zu HSV (`vision_yolo.py`)
 - [ ] Hintergrund-Phasenkorrelation (`cv2.phaseCorrelate`) für die eigene Geschwindigkeit statt fester `base_speed_px_s`
-- [ ] Score per OCR, Logging der Rundenergebnisse für automatisches Parameter-Tuning
+- [x] Score per OCR, Logging der Rundenergebnisse für automatisches Parameter-Tuning
 - [ ] 2D-Simulator + PPO mit Heuristik-Shield

@@ -50,9 +50,10 @@ class VisionConfig:
     head_window: int = 20
 
     # --- enemy heads via their eyes (white sclera + black pupil) --------------
-    eye_lower: tuple = (0, 0, 215)
-    eye_upper: tuple = (179, 40, 255)
-    eye_min_area: int = 3
+    # real frames: glowing (boosting) snakes tint their eyes, S up to ~65
+    eye_lower: tuple = (0, 0, 190)
+    eye_upper: tuple = (179, 70, 255)
+    eye_min_area: int = 2
     eye_max_area: int = 120
     eye_pupil_max_v: int = 70
     eye_min_pupil_px: int = 1
@@ -67,17 +68,27 @@ class VisionConfig:
     border_min_area: int = 1500
 
     # --- minimap (bottom right) gives the position inside the circular world --
+    # measured on a real 1920x1080 frame: circle centre (0.95, 0.911)
     minimap_enabled: bool = True
-    minimap_rect: tuple = (0.875, 0.80, 0.985, 0.985)   # relative x0, y0, x1, y1
+    minimap_rect: tuple = (0.912, 0.846, 0.988, 0.976)  # relative x0, y0, x1, y1
     minimap_radius_frac: float = 0.95
     minimap_dot_lower: tuple = (0, 0, 190)
     minimap_dot_upper: tuple = (179, 90, 255)
 
+    # --- start / death menu: green "Spielen"/"Play Again" button under the
+    # purple nickname box (colours taken from the page's CSS) ---------------
+    menu_button_lower: tuple = (65, 80, 90)
+    menu_button_upper: tuple = (85, 175, 190)
+    menu_nick_lower: tuple = (115, 70, 90)
+    menu_nick_upper: tuple = (132, 160, 160)
+    menu_button_min_area: int = 300
+    menu_button_max_area: int = 4000
+
     # --- HUD regions that must never be interpreted as game objects ----------
     ui_rects: list = field(default_factory=lambda: [
-        [0.78, 0.00, 1.00, 0.42],   # leaderboard
-        [0.00, 0.88, 0.32, 1.00],   # length / rank
-        [0.84, 0.76, 1.00, 1.00],   # minimap
+        [0.84, 0.00, 1.00, 0.22],   # leaderboard ("Bestenliste")
+        [0.00, 0.95, 0.12, 1.00],   # length / rank
+        [0.90, 0.83, 1.00, 1.00],   # minimap + server label
     ])
     max_obstacle_points: int = 8000
 
@@ -148,6 +159,14 @@ class BrainConfig:
     encircle_gain: float = 1.5
     encircle_max_s: float = 8.0
 
+    # HUNT: shadow a smaller snake alongside its path until a CUTOFF is possible
+    hunt_enabled: bool = False
+    hunt_radius: float = 420.0
+    hunt_size_ratio: float = 1.0
+    hunt_offset: float = 90.0             # lateral distance to its path
+    hunt_lead: float = 60.0               # how far ahead of its head we aim
+    hunt_max_s: float = 6.0
+
     # --- head tracker --------------------------------------------------------
     tracker_max_speed_px_s: float = 900.0
     tracker_max_age_s: float = 0.3
@@ -166,13 +185,41 @@ class RuntimeConfig:
     start_paused: bool = True             # press F8 in the game window to start
     foreground_check: bool = True         # pause while the game window is not focused
     auto_respawn: bool = False
-    respawn_delay_s: float = 2.5
-    respawn_retry_s: float = 4.0
-    respawn_click_rel: tuple = (0.5, 0.6) # "Play" button, relative to the game region
-    respawn_press_enter: bool = True
+    respawn_delay_s: float = 1.0          # menu must be visible this long before clicking
+    respawn_retry_s: float = 3.0
+    respawn_click_rel: tuple = (0.5, 0.415)   # fallback if the button is not detected
+    respawn_press_enter: bool = False
     debug: bool = False
     debug_every: int = 2
     stats_interval_s: float = 2.0
+
+
+@dataclass
+class HudConfig:
+    """Reads 'Deine Länge', 'Dein rang' and the final length with Windows OCR."""
+    enabled: bool = True
+    lang: str = "de"                      # needs the Windows OCR language pack
+    interval_s: float = 0.5
+    upscale: float = 3.0
+    # regions in full-resolution game coordinates (relative)
+    stats_rect: tuple = (0.0, 0.955, 0.12, 1.0)       # bottom left, measured on 1920x1080
+    final_rect: tuple = (0.30, 0.235, 0.70, 0.295)    # "Deine endgültige Länge war N"
+    length_regex: str = r"(?:L[äa]nge|length)\D{0,4}(\d+)"
+    rank_regex: str = r"(?:rang|rank)\D{0,4}(\d+)\D{1,6}(\d+)"
+    final_regex: str = r"(?:war|was)\D{0,3}(\d+)"
+
+
+@dataclass
+class TrainConfig:
+    state_dir: str = "tuning"
+    episodes_per_candidate: int = 3
+    incumbent_every: int = 4              # every Nth episode re-plays the incumbent (fights luck)
+    sigma_start: float = 0.15             # mutation size in normalised [0, 1] space
+    sigma_min: float = 0.03
+    sigma_max: float = 0.40
+    early_reject: float = 0.35            # candidate's 1st score < this * incumbent median -> reject
+    accept_margin: float = 0.02           # log-score margin a candidate must beat
+    final_length_wait_s: float = 2.0      # how long to wait for the death screen OCR
 
 
 @dataclass
@@ -182,6 +229,26 @@ class BotConfig:
     brain: BrainConfig = field(default_factory=BrainConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    hud: HudConfig = field(default_factory=HudConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+
+
+# Starting point for --aggressive / --train: less fear, more boosting and hunting.
+AGGRESSIVE = {
+    "w_danger": 2.6, "danger_radius": 105.0, "clearance_factor": 1.3,
+    "hard_min_clearance": 28.0, "escape_danger": 0.7, "head_threat_radius": 130.0,
+    "w_food": 1.4, "feast_threshold": 150.0, "boost_min_self_area": 700,
+    "cutoff_size_ratio": 1.6, "cutoff_max_dist": 400.0, "cutoff_time_margin": 0.9,
+    "cutoff_min_enemy_speed": 40.0, "encircle_min_self_area": 3500,
+    "encircle_size_ratio": 0.8, "hunt_enabled": True,
+}
+
+
+def apply_brain_params(cfg: BotConfig, params: dict) -> None:
+    for key, value in params.items():
+        if not hasattr(cfg.brain, key):
+            raise KeyError(f"unknown brain parameter: {key}")
+        setattr(cfg.brain, key, type(getattr(cfg.brain, key))(value))
 
 
 def load_config(path: str | Path | None = None) -> BotConfig:

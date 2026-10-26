@@ -35,6 +35,16 @@ class LatestFrameBuffer:
         self._cond = threading.Condition()
         self._frame: Frame | None = None
         self._next_id = 1
+        self._hud: tuple[float, dict[str, np.ndarray]] | None = None
+
+    def publish_hud(self, crops: dict[str, np.ndarray], timestamp: float) -> None:
+        with self._cond:
+            self._hud = (timestamp, crops)
+
+    def latest_hud(self) -> tuple[float, dict[str, np.ndarray]] | None:
+        """Full-resolution HUD crops (for OCR) and their grab time."""
+        with self._cond:
+            return self._hud
 
     def publish(self, image: np.ndarray, timestamp: float) -> None:
         with self._cond:
@@ -72,11 +82,15 @@ def _on_primary_monitor(region: tuple[int, int, int, int]) -> bool:
 
 class ScreenCapture(threading.Thread):
     def __init__(self, region: tuple[int, int, int, int], cfg: CaptureConfig,
-                 buffer: LatestFrameBuffer) -> None:
+                 buffer: LatestFrameBuffer, hud_rects: dict[str, tuple] | None = None,
+                 hud_interval_s: float = 0.5) -> None:
         super().__init__(daemon=True, name="capture")
         self.region = region            # left, top, width, height (screen pixels)
         self.cfg = cfg
         self.buffer = buffer
+        self.hud_rects = hud_rects or {}
+        self.hud_interval_s = hud_interval_s
+        self._last_hud = 0.0
         self.backend = pick_backend(cfg.backend)
         if self.backend in ("dxcam", "bettercam") and not _on_primary_monitor(region):
             # dxcam captures the primary output only; mss handles the whole virtual desktop
@@ -92,6 +106,13 @@ class ScreenCapture(threading.Thread):
         self._stop_event.set()
 
     def _publish(self, bgr: np.ndarray, ts: float) -> None:
+        if self.hud_rects and ts - self._last_hud >= self.hud_interval_s:
+            # small text needs full resolution, so crop before downscaling
+            h, w = bgr.shape[:2]
+            crops = {name: bgr[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)].copy()
+                     for name, (x0, y0, x1, y1) in self.hud_rects.items()}
+            self.buffer.publish_hud(crops, ts)
+            self._last_hud = ts
         if self.cfg.scale != 1.0:
             # INTER_AREA averages pixels: small food stays visible after downscaling
             bgr = cv2.resize(bgr, self.out_size, interpolation=cv2.INTER_AREA)

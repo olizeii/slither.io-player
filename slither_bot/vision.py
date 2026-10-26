@@ -49,6 +49,7 @@ class GameState:
     heads: list[EnemyHead] = field(default_factory=list)
     border_angle: float | None = None          # direction from us towards the nearest border
     border_proximity: float = 0.0              # 0 = world centre, 1 = on the border
+    menu_button: tuple[float, float] | None = None   # start/death menu visible -> button centre
     debug: dict = field(default_factory=dict)
 
     @property
@@ -65,6 +66,9 @@ class Vision:
         self._b1_lo, self._b1_hi = _u8(cfg.border_lower1), _u8(cfg.border_upper1)
         self._b2_lo, self._b2_hi = _u8(cfg.border_lower2), _u8(cfg.border_upper2)
         self._dot_lo, self._dot_hi = _u8(cfg.minimap_dot_lower), _u8(cfg.minimap_dot_upper)
+        self._btn_lo, self._btn_hi = _u8(cfg.menu_button_lower), _u8(cfg.menu_button_upper)
+        self._nick_lo, self._nick_hi = _u8(cfg.menu_nick_lower), _u8(cfg.menu_nick_upper)
+        self._k5 = np.ones((5, 5), np.uint8)
         k = cfg.close_kernel
         self._close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)) if k > 1 else None
         self._k3 = np.ones((3, 3), np.uint8)
@@ -143,10 +147,11 @@ class Vision:
             xs, ys = xs[::step], ys[::step]
         obstacles = np.column_stack([xs, ys]).astype(np.float32)
 
+        menu_button = self._find_menu(hsv)
         state = GameState(
             timestamp=timestamp, width=w, height=h,
-            alive=bool(self_label) and area[self_label] >= c.min_self_area,
-            food=food, obstacles=obstacles,
+            alive=bool(self_label) and area[self_label] >= c.min_self_area and menu_button is None,
+            food=food, obstacles=obstacles, menu_button=menu_button,
         )
         if state.alive:
             state.self_area = int(area[self_label])
@@ -208,9 +213,14 @@ class Vision:
             xi, yi = int(ex), int(ey)
             if not obstacle[max(yi - 3, 0):yi + 4, max(xi - 3, 0):xi + 4].any():
                 continue                          # white food etc., not on a snake
-            x, y = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
-            bw, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
-            pupil = np.count_nonzero(value[y:y + bh, x:x + bw] <= c.eye_pupil_max_v)
+            # the pupil sits in or right next to the white; it must lie inside the
+            # (hole-filled) snake body, otherwise it is just dark background
+            x = max(stats[i, cv2.CC_STAT_LEFT] - 3, 0)
+            y = max(stats[i, cv2.CC_STAT_TOP] - 3, 0)
+            x1 = stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH] + 3
+            y1 = stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] + 3
+            body = cv2.morphologyEx(obstacle[y:y1, x:x1], cv2.MORPH_CLOSE, self._k5)
+            pupil = np.count_nonzero((value[y:y1, x:x1] <= c.eye_pupil_max_v) & (body > 0))
             if pupil < c.eye_min_pupil_px:
                 continue                          # white skin patch, no pupil
             eyes.append((float(ex), float(ey)))
@@ -236,6 +246,32 @@ class Vision:
             dist = cv2.distanceTransform((roi > 0).astype(np.uint8), cv2.DIST_L2, 3)
             heads.append(EnemyHead(hx, hy, float(dist.max()) if dist.size else 0.0))
         return heads
+
+    # ------------------------------------------------------------------ menu
+    def _find_menu(self, hsv: np.ndarray) -> tuple[float, float] | None:
+        """Green, wide, rounded button with the purple nickname box right above it."""
+        c = self.cfg
+        h, w = hsv.shape[:2]
+        x0, x1 = int(0.3 * w), int(0.7 * w)
+        y0, y1 = int(0.15 * h), int(0.85 * h)
+        sub = hsv[y0:y1, x0:x1]
+        btn = cv2.morphologyEx(cv2.inRange(sub, self._btn_lo, self._btn_hi), cv2.MORPH_CLOSE, self._k5)
+        n, _, stats, cents = cv2.connectedComponentsWithStats(btn, connectivity=8)
+        if n <= 1:
+            return None
+        nick = cv2.inRange(sub, self._nick_lo, self._nick_hi)
+        for i in range(1, n):
+            a = stats[i, cv2.CC_STAT_AREA]
+            bx, by = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
+            bw, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+            if not (c.menu_button_min_area <= a <= c.menu_button_max_area):
+                continue
+            if not (1.6 <= bw / max(bh, 1) <= 4.5) or a / max(bw * bh, 1) < 0.6:
+                continue
+            above = nick[max(by - 3 * bh, 0):by, max(bx - bw, 0):bx + 2 * bw]
+            if np.count_nonzero(above) >= 0.3 * a:
+                return float(x0 + cents[i][0]), float(y0 + cents[i][1])
+        return None
 
     # ------------------------------------------------------------------ minimap
     def _read_minimap(self, state: GameState, hsv: np.ndarray) -> None:
