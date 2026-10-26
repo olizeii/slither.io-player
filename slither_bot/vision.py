@@ -33,6 +33,7 @@ class EnemyHead:
     x: float
     y: float
     radius: float
+    body_area: float = 0.0          # visible pixels of the snake this head belongs to
 
 
 @dataclass
@@ -44,6 +45,9 @@ class GameState:
     self_radius: float = 0.0
     self_area: int = 0
     self_heading: float | None = None          # radians, screen coords (y down)
+    self_points: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), np.float32))
+    self_length_px: float = 0.0                # visible own body length on screen
+    length: int | None = None                  # real length from the HUD (OCR), set by main
     food: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.float32))      # x, y, weight
     obstacles: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), np.float32))  # x, y
     heads: list[EnemyHead] = field(default_factory=list)
@@ -195,6 +199,13 @@ class Vision:
         if state.alive:
             state.self_area = int(area[self_label])
             self._analyze_self(state, labels, self_label, cx, cy)
+            # whole own body (for circling: does our ring close around the prey?)
+            own = cv2.findNonZero(cv2.compare(labels, self_label, cv2.CMP_EQ))
+            if own is not None:
+                own = own.reshape(-1, 2)
+                state.self_points = own[::max(1, len(own) // c.max_self_points)].astype(np.float32)
+            # visible length of our body in px: area / thickness
+            state.self_length_px = state.self_area / max(2.0 * state.self_radius, 1.0)
         # own eyes are excluded by label already; this drops leftovers near the centre
         exclusion = max(c.self_eye_exclusion, 3.0 * state.self_radius)
         state.heads = [hd for hd in heads if math.hypot(hd.x - cx, hd.y - cy) >= exclusion]
@@ -294,7 +305,8 @@ class Vision:
             xi, yi = int(hx), int(hy)
             roi = obstacle[max(yi - r, 0):min(yi + r + 1, h), max(xi - r, 0):min(xi + r + 1, w)]
             dist = cv2.distanceTransform((roi > 0).astype(np.uint8), cv2.DIST_L2, 3)
-            heads.append(EnemyHead(hx, hy, float(dist.max()) if dist.size else 0.0))
+            heads.append(EnemyHead(hx, hy, float(dist.max()) if dist.size else 0.0,
+                                   float(area[eye_labels[group[0]]])))
         return heads, eyed
 
     # ------------------------------------------------------------------ menu

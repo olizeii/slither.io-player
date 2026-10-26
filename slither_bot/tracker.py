@@ -23,6 +23,7 @@ class Track:
     vx: float = 0.0
     vy: float = 0.0
     hits: int = 1
+    body_area: float = 0.0
     meas_x: float = 0.0
     meas_y: float = 0.0
 
@@ -63,6 +64,7 @@ class HeadTracker:
             tr.y += tr.vy * dt
 
         dets = [(hd.x - cx, hd.y - cy, hd.radius) for hd in heads]
+        areas = [hd.body_area for hd in heads]
         pairs = []
         for tid, tr in self.tracks.items():
             gate = self.max_speed * max(t - tr.last_seen, 1.0 / 60.0) + 2.0 * tr.radius
@@ -89,12 +91,13 @@ class HeadTracker:
                 tr.vy += a * (mvy - tr.vy)
             tr.x, tr.y, tr.radius, tr.last_seen = x, y, r, t
             tr.meas_x, tr.meas_y = x, y
+            tr.body_area = areas[k]
             tr.hits += 1
 
         for k, (x, y, r) in enumerate(dets):
             if k not in used_dets:
                 tid = next(self._ids)
-                self.tracks[tid] = Track(tid, x, y, r, t)
+                self.tracks[tid] = Track(tid, x, y, r, t, body_area=areas[k])
 
         # tracks dropped this frame (at their last *measured* position) -> death candidates
         self.lost = [self.tracks.pop(tid) for tid in

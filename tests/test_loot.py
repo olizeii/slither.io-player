@@ -58,6 +58,7 @@ def test_kill_leads_to_loot_mode():
         t += 1 / 30
     assert Mode.LOOT in modes
     assert any(z.source == "death" and z.confirmed for z in brain.zones)
+    assert brain.stats["deaths_seen"] == 1 and brain.stats["loot_runs"] >= 1
     assert abs(wrap(a.angle - math.atan2(-30, 160))) < math.radians(30)   # towards the remains
 
 
@@ -75,19 +76,27 @@ def test_vanished_head_without_remains_is_ignored():
     assert a.mode is not Mode.LOOT and not brain.zones
 
 
-def test_merged_orbs_in_zone_become_food_not_wall():
-    vision, brain = Vision(VCFG), Brain(BrainConfig())
-    img = syn.background()
-    own_snake(img)
-    for k in range(10):                                   # overlapping orbs -> one long eyeless blob
-        cv2.circle(img, (600 + k * 9, 200), 8, (255, 120, 255), -1)
-    s = vision.analyze(img, 0.0)
-    assert len(s.eyeless_blobs) == 1 and s.obstacle_eyeless.any()
-    from slither_bot.brain import LootZone
-    brain.zones = [LootZone(160.0, -70.0, 0.0, "death", confirmed=True)]
-    obstacles, food = brain._apply_loot(s, *s.center)
-    assert len(obstacles) < len(s.obstacles)
-    assert len(food) == len(s.food) + 1
+def test_living_snake_with_flickering_eyes_is_not_a_kill():
+    """The overnight bug: eyes drop out of the detection for a moment, body stays ->
+    must NOT become a loot zone (the bot used to drive straight into such bodies)."""
+    vision, brain = Vision(VCFG), Brain(BrainConfig(pit_enabled=False))
+    t = 0.0
+    for _ in range(12):
+        brain.decide(vision.analyze(scene_enemy_alive(), t))
+        t += 1 / 30
+    no_eyes = syn.background()
+    own_snake(no_eyes)
+    syn.draw_snake(no_eyes, [(610 + k * 3, 270 - k * 2) for k in range(40)], 9, (200, 60, 200))
+    for k in range(5):                                    # some big food lying around it
+        cv2.circle(no_eyes, (600 + 14 * k, 300), 6, (0, 200, 255), -1)
+    modes = []
+    for _ in range(45):
+        a = brain.decide(vision.analyze(no_eyes, t))
+        modes.append(a.mode)
+        t += 1 / 30
+    assert Mode.LOOT not in modes
+    assert not any(z.source == "death" and z.confirmed for z in brain.zones)
+    assert brain.stats["deaths_seen"] == 0
 
 
 def test_food_pile_becomes_pit_target():
@@ -118,12 +127,26 @@ def test_minimap_crowd_and_position():
     assert info.crowd_mass > 20
 
 
-def test_crowd_bias_steers_when_nothing_to_eat():
-    vision, brain = Vision(VCFG), Brain(BrainConfig(w_crowd=1.0))
+def test_pro_loop_travels_to_hotspot_when_big_enough():
+    vision, brain = Vision(VCFG), Brain(BrainConfig())
     img = syn.background()
     own_snake(img)
     s = vision.analyze(img, 0.0)
-    s.crowd_angle, s.crowd_dist, s.crowd_mass = math.pi / 2, 0.6, 100.0   # crowd is below us
+    s.crowd_angle, s.crowd_dist, s.crowd_mass = math.pi / 2, 0.6, 100.0   # hotspot is below us
+    s.length = 300
     a = brain.decide(s)
-    assert a.mode is Mode.FORAGE
+    assert a.mode is Mode.TRAVEL and a.debug["phase"] == "TRAVEL"
     assert abs(wrap(a.angle - math.pi / 2)) < math.radians(35)
+
+
+def test_pro_loop_farms_first_when_small():
+    vision, brain = Vision(VCFG), Brain(BrainConfig())
+    img = syn.background()
+    own_snake(img)
+    syn.draw_food(img, (480, 130), 15, 45)                # food up, hotspot down
+    s = vision.analyze(img, 0.0)
+    s.crowd_angle, s.crowd_dist, s.crowd_mass = math.pi / 2, 0.6, 100.0
+    s.length = 20
+    a = brain.decide(s)
+    assert a.debug["phase"] == "FARM"
+    assert abs(wrap(a.angle + math.pi / 2)) < math.radians(45)          # goes for the food

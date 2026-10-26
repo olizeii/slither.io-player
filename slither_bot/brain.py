@@ -48,6 +48,7 @@ class Mode(str, enum.Enum):
     ENCIRCLE = "encircle"
     HUNT = "hunt"
     LOOT = "loot"
+    TRAVEL = "travel"
 
 
 @dataclass
@@ -68,6 +69,14 @@ class _Maneuver:
     phase_started: float = 0.0
     hold_angle: float = 0.0
     orbit_sign: float = 1.0
+    # circling
+    kind: str = ""                  # "snake" or "pit"
+    orbit: float = 0.0              # current ring radius
+    inner: float = 0.0              # never tighter than this (prey body / own thickness)
+    coverage: float = 0.0           # how much of the ring our body already closes
+    zone: "LootZone | None" = None
+    last_t: float = 0.0
+    center: tuple = (0.0, 0.0)      # ring centre (relative), for the debug overlay
 
 
 @dataclass
@@ -78,6 +87,7 @@ class LootZone:
     source: str             # "death" (a head vanished in view) or "pit" (big food pile)
     confirmed: bool = False
     mass: float = 0.0
+    track_id: int = -1      # which head vanished (kill credit)
 
 
 @dataclass
@@ -104,9 +114,12 @@ class Brain:
         self.zones: list[LootZone] = []
         self._last_t: float | None = None
         self._last_boost = False
+        self.stats = {"kills": 0, "deaths_seen": 0, "loot_runs": 0}
+        self._recent_targets: dict[int, float] = {}   # track id -> last time we attacked it
+        self._last_mode = Mode.FORAGE
         self._ego = np.zeros(2)                    # our own integrated movement (prey detection)
         self._food_hist: list[tuple[float, np.ndarray]] = []
-        # per-frame views of the scene after loot handling (see _apply_loot)
+        # per-frame views of the scene used by the profiles (food after prey discount)
         self._obstacles: np.ndarray | None = None
         self._food: np.ndarray | None = None
 
@@ -215,7 +228,9 @@ class Brain:
         self._update_heading(s, dt)
         s.food = self._discount_movers(s, cx, cy, t, dt)
         self._update_loot(s, tracks, cx, cy, t, dt)
-        self._obstacles, self._food = self._apply_loot(s, cx, cy)
+        self._obstacles, self._food = s.obstacles, s.food
+        if self.maneuver is not None:
+            self._recent_targets[self.maneuver.target_id] = t
         self_r = max(s.self_radius, cfg.min_self_radius)
         margin = cfg.clearance_factor * self_r + cfg.clearance_pad
 
@@ -242,33 +257,54 @@ class Brain:
             dbg.update(score=esc, threat=threat.id if threat else None)
             return self._act(float(self.angles[best]), boost, Mode.ESCAPE, dbg)
 
-        # ---- loot first: remains of a kill / big food piles -------------------
+        # ======== the pro loop: hotspot -> kill -> loot -> (circle) -> repeat ====
+        small = self._is_small(s)
+
+        # ---- 2. LOOT: remains of a confirmed kill / a big pile, before others --
         zone = self._best_zone(tracks)
         if zone is not None:
             dist = math.hypot(zone.x, zone.y)
             angle = math.atan2(zone.y, zone.x)
-            if dist > 0.5 * cfg.loot_radius and self._safe(p, angle, min(dist, 150.0)):
-                self.maneuver = None
-                k = int(self.sector_of(angle))
-                worth = zone.source == "death" or zone.mass >= 2 * cfg.pit_min_mass
-                boost = can_boost and worth and dist > cfg.loot_boost_dist and turn[k] < 0.35
-                dbg["score"] = None
-                return self._act(angle, boost, Mode.LOOT, dbg)
-            # inside the zone: FORAGE eats it, the orbs are food now
+            # long enough to put a ring around the pile? then we circle it (protects it)
+            if (zone.source == "pit" and self.maneuver is None and not small
+                    and dist < 2 * cfg.loot_radius):
+                self.maneuver = self._circle_pit(s, zone, t)
+            if self.maneuver is None or self.maneuver.mode is not Mode.ENCIRCLE:
+                if dist > 0.5 * cfg.loot_radius and self._safe(p, angle, min(dist, 150.0)):
+                    self.maneuver = None
+                    k = int(self.sector_of(angle))
+                    worth = zone.source == "death" or zone.mass >= 2 * cfg.pit_min_mass
+                    boost = can_boost and worth and dist > cfg.loot_boost_dist and turn[k] < 0.35
+                    dbg.update(score=None, phase="LOOT")
+                    return self._act(angle, boost, Mode.LOOT, dbg)
+                # inside the zone: FARM below eats the orbs
 
-        # ---- Prio 3: running or new tactical maneuver ------------------------
+        # ---- 3./4. CIRCLE, then ATTACK (cutoff / hunt): running or new ---------
         if self.maneuver is None:
-            self.maneuver = self._find_maneuver(s, tracks, cx, cy, margin, t)
+            self.maneuver = self._find_maneuver(s, tracks, cx, cy, margin, t, small)
         if self.maneuver is not None:
             res = self._run_maneuver(s, tracks, cx, cy, margin, t, can_boost)
             if res is not None:
-                dbg["score"] = None
-                return self._act(res[0], res[1], self.maneuver.mode if self.maneuver else Mode.FORAGE, dbg)
+                mode = self.maneuver.mode if self.maneuver else Mode.FORAGE
+                dbg.update(score=None, phase="CIRCLE" if mode is Mode.ENCIRCLE else "ATTACK")
+                if mode is Mode.ENCIRCLE and self.maneuver is not None:
+                    dbg["ring"] = (self.maneuver.center, self.maneuver.orbit, self.maneuver.coverage)
+                return self._act(res[0], res[1], mode, dbg)
 
-        # ---- Prio 2: growth ----------------------------------------------------
-        score = cfg.w_food * food - cfg.w_danger * p.danger - cfg.w_turn * turn - cfg.w_switch * switch
+        # ---- 5. TRAVEL to the minimap hotspot (no fight in view, big enough) --
+        base = -cfg.w_danger * p.danger - cfg.w_turn * turn - cfg.w_switch * switch
+        hotspot = (s.crowd_angle is not None and s.crowd_mass >= cfg.crowd_min_mass
+                   and s.crowd_dist > cfg.hotspot_arrive)
+        if hotspot and not small and not tracks:
+            pull = np.clip(np.cos(self.angles - s.crowd_angle), 0, None)
+            score = base + cfg.w_travel * pull + cfg.travel_food_share * cfg.w_food * food
+            score[blocked] = -np.inf
+            dbg.update(score=score, phase="TRAVEL")
+            return self._act(float(self.angles[int(np.argmax(score))]), False, Mode.TRAVEL, dbg)
+
+        # ---- 6. FARM: grow (start of a round) or patrol inside the hotspot -----
+        score = base + cfg.w_food * food
         if s.crowd_angle is not None and s.crowd_mass >= cfg.crowd_min_mass:
-            # minimap: head for the populated areas, where kills and loot happen
             pull = cfg.w_crowd * min(1.0, 3.0 * s.crowd_dist)
             score += pull * np.clip(np.cos(self.angles - s.crowd_angle), 0, None)
         elif food.max() == 0 and s.border_angle is not None:
@@ -280,13 +316,23 @@ class Brain:
         boost = False
         if (can_boost and mass[best] >= cfg.feast_threshold and p.danger[best] < 0.2
                 and p.clear[best] > cfg.feast_radius and turn[best] < 0.25):
-            mode, boost = Mode.FEAST, True               # grab dead-snake remains first
-        dbg["score"] = score
+            mode, boost = Mode.FEAST, True
+        dbg.update(score=score, phase="FARM" if small else "PATROL")
         return self._act(float(self.angles[best]), boost, mode, dbg)
+
+    def _is_small(self, s: GameState) -> bool:
+        """Self-awareness: still in the growing phase of a round?"""
+        if s.length is not None:
+            return s.length < self.cfg.grow_until_length
+        return s.self_area < self.cfg.grow_until_area
 
     def _act(self, angle: float, boost: bool, mode: Mode, dbg: dict) -> Action:
         self.last_angle = angle
         self._last_boost = boost
+        if mode is Mode.LOOT and self._last_mode is not Mode.LOOT:
+            self.stats["loot_runs"] += 1
+        self._last_mode = mode
+        dbg.setdefault("phase", "SURVIVE" if mode is Mode.ESCAPE else mode.value.upper())
         return Action(angle, boost, mode, dbg)
 
     # ================================================================ prey
@@ -320,12 +366,16 @@ class Brain:
 
     # ================================================================ loot
     def _loot_items(self, s: GameState, cx: float, cy: float) -> np.ndarray:
-        """Relative (x, y, mass) of everything that could be remains of a snake."""
+        """Relative (x, y, mass) of separate big orbs = what a dead snake leaves behind.
+
+        Eyeless blobs are deliberately NOT counted: overnight data showed ~25 % of the
+        time in LOOT, mostly because a living snake whose eyes flickered out of the
+        detection looked like 'head gone + eyeless blob = dead'.
+        """
         big = s.food[s.food[:, 2] >= self.cfg.loot_item_min_weight] if len(s.food) else s.food
-        items = np.concatenate([big, s.eyeless_blobs]) if len(s.eyeless_blobs) else big
-        if len(items) == 0:
+        if len(big) == 0:
             return np.zeros((0, 3))
-        return np.column_stack([items[:, 0] - cx, items[:, 1] - cy, items[:, 2]])
+        return np.column_stack([big[:, 0] - cx, big[:, 1] - cy, big[:, 2]])
 
     def _update_loot(self, s: GameState, tracks: list[Track], cx: float, cy: float,
                      t: float, dt: float) -> None:
@@ -343,7 +393,7 @@ class Brain:
                 ax, ay = tr.x + cx, tr.y + cy
                 if (tr.hits >= cfg.death_min_hits and m < ax < s.width - m and m < ay < s.height - m
                         and tr.dist <= cfg.loot_max_dist):
-                    self.zones.append(LootZone(tr.x, tr.y, t, "death"))
+                    self.zones.append(LootZone(tr.x, tr.y, t, "death", track_id=tr.id))
 
         loot_items = self._loot_items(s, cx, cy)
         all_food = (np.column_stack([s.food[:, 0] - cx, s.food[:, 1] - cy, s.food[:, 2]])
@@ -352,9 +402,11 @@ class Brain:
         for z in self.zones:
             # deaths are confirmed by orbs/remains, pits by any food
             items = loot_items if z.source == "death" else all_food
+            n_items = 0
             if len(items):
                 d = np.hypot(items[:, 0] - z.x, items[:, 1] - z.y)
                 near = d < cfg.loot_radius
+                n_items = int(np.count_nonzero(near))
                 z.mass = float(items[near, 2].sum())
                 if z.mass > 0:                     # re-centre on what is actually there
                     w = items[near, 2]
@@ -364,8 +416,10 @@ class Brain:
                 z.mass = 0.0
             age = t - z.t0
             if not z.confirmed:
-                if z.mass >= cfg.death_confirm_mass:
-                    z.confirmed = True             # it really died: remains appeared
+                if (z.mass >= cfg.death_confirm_mass and n_items >= cfg.death_min_orbs
+                        and self._body_points_near(s, cx, cy, z.x, z.y) <= cfg.death_max_body_pts):
+                    z.confirmed = True             # it really died: orbs appeared, body is gone
+                    self._credit_death(s, z, cx, cy, t)
                 elif age > cfg.death_confirm_s:
                     continue                       # just left our sight / eye detection flicker
             elif age > cfg.loot_zone_s or (age > 1.0 and z.mass < cfg.loot_min_mass):
@@ -379,6 +433,25 @@ class Brain:
             pit = self._find_pit(s, cx, cy, t)
             if pit is not None:
                 self.zones.append(pit)
+
+    def _body_points_near(self, s: GameState, cx: float, cy: float, zx: float, zy: float) -> int:
+        """Obstacle pixels right where a snake supposedly died: a living body = no death."""
+        if len(s.obstacles) == 0:
+            return 0
+        d = np.hypot(s.obstacles[:, 0] - cx - zx, s.obstacles[:, 1] - cy - zy)
+        return int(np.count_nonzero(d < self.cfg.death_clear_radius))
+
+    def _credit_death(self, s: GameState, z: LootZone, cx: float, cy: float, t: float) -> None:
+        cfg = self.cfg
+        self.stats["deaths_seen"] += 1
+        ours = t - self._recent_targets.get(z.track_id, -1e9) < cfg.kill_credit_s
+        if not ours and math.hypot(z.x, z.y) < cfg.kill_credit_dist:
+            ours = True                               # died right next to our head
+        if not ours and len(s.self_points):          # ... or against our body
+            d = np.hypot(s.self_points[:, 0] - cx - z.x, s.self_points[:, 1] - cy - z.y)
+            ours = float(d.min()) < cfg.kill_credit_dist
+        if ours:
+            self.stats["kills"] += 1
 
     def _find_pit(self, s: GameState, cx: float, cy: float, t: float) -> LootZone | None:
         """Densest pile of food in view (grid + 3x3 box sum)."""
@@ -426,30 +499,6 @@ class Brain:
                 best, best_score = z, score
         return best
 
-    def _apply_loot(self, s: GameState, cx: float, cy: float):
-        """Inside confirmed loot zones, eyeless blobs are remains: food, not walls."""
-        zones = [z for z in self.zones if z.confirmed]
-        if not zones or (len(s.obstacle_eyeless) == 0 and len(s.eyeless_blobs) == 0):
-            return s.obstacles, s.food
-        r = self.cfg.loot_radius
-
-        def in_zone(x, y):
-            inside = np.zeros(len(x), bool)
-            for z in zones:
-                inside |= np.hypot(x - cx - z.x, y - cy - z.y) < r
-            return inside
-
-        obstacles = s.obstacles
-        if len(s.obstacles) and len(s.obstacle_eyeless) == len(s.obstacles):
-            drop = s.obstacle_eyeless & in_zone(s.obstacles[:, 0], s.obstacles[:, 1])
-            obstacles = s.obstacles[~drop]
-        food = s.food
-        if len(s.eyeless_blobs):
-            loot = s.eyeless_blobs[in_zone(s.eyeless_blobs[:, 0], s.eyeless_blobs[:, 1])]
-            if len(loot):
-                food = np.concatenate([s.food, loot]).astype(np.float32)
-        return obstacles, food
-
     def _update_heading(self, s: GameState, dt: float) -> None:
         cfg = self.cfg
         step = float(np.clip(wrap(self.last_angle - self.heading), -cfg.turn_rate * dt, cfg.turn_rate * dt))
@@ -481,29 +530,105 @@ class Brain:
         vhat = ve / speed
         return np.array([tr.x, tr.y]) + vhat * lead, speed, vhat
 
-    def _find_maneuver(self, s, tracks, cx, cy, margin, t) -> _Maneuver | None:
+    def _find_maneuver(self, s, tracks, cx, cy, margin, t, small: bool = False) -> _Maneuver | None:
+        """Attack priority: circle (if we are long enough) > cutoff > hunt."""
         cfg = self.cfg
+        if not small:
+            circle = self._find_circle(s, tracks, cx, cy, margin, t)
+            if circle is not None:
+                return circle
         cut = self._find_cutoff(s, tracks, cx, cy, margin, t)
         if cut is not None:
             return cut
-
-        if cfg.encircle_enabled and s.self_area >= cfg.encircle_min_self_area:
-            prey = [tr for tr in tracks if tr.dist <= cfg.encircle_start_dist
-                    and tr.radius <= s.self_radius * cfg.encircle_size_ratio]
-            if prey:
-                tr = min(prey, key=lambda x: x.dist)
-                radial = np.array([tr.x, tr.y]) / max(tr.dist, 1e-6)
-                perp = np.array([-radial[1], radial[0]])
-                heading_vec = np.array([math.cos(self.heading), math.sin(self.heading)])
-                sign = 1.0 if float(np.dot(perp, heading_vec)) >= 0 else -1.0
-                return _Maneuver(Mode.ENCIRCLE, tr.id, t, orbit_sign=sign)
-
-        if cfg.hunt_enabled:
+        if cfg.hunt_enabled and not small:
             prey = [tr for tr in tracks if tr.dist <= cfg.hunt_radius
                     and tr.radius <= s.self_radius * cfg.hunt_size_ratio]
             if prey:
                 return _Maneuver(Mode.HUNT, min(prey, key=lambda x: x.dist).id, t)
         return None
+
+    # ================================================================ circling
+    def _long_enough(self, s: GameState) -> bool:
+        if s.length is not None:
+            return s.length >= self.cfg.circle_min_length
+        return s.self_area >= self.cfg.encircle_min_self_area
+
+    def _ring_radius_max(self, s: GameState) -> float:
+        """Largest ring our (visible) body can close: circumference must fit, with slack."""
+        return s.self_length_px / (2 * math.pi * self.cfg.ring_slack)
+
+    def _orbit_sign(self, ox: float, oy: float) -> float:
+        d = max(math.hypot(ox, oy), 1e-6)
+        perp = np.array([-oy / d, ox / d])
+        heading_vec = np.array([math.cos(self.heading), math.sin(self.heading)])
+        return 1.0 if float(np.dot(perp, heading_vec)) >= 0 else -1.0   # keep turning the way we go
+
+    def _ring_coverage(self, s: GameState, cx: float, cy: float, ox: float, oy: float, R: float) -> float:
+        """How much of the circle around (ox, oy) our own body already covers (0..1).
+
+        This is the 'does the ring close?' check: our body points are binned by angle
+        around the prey; 1.0 = it is completely walled in by us.
+        """
+        if len(s.self_points) == 0:
+            return 0.0
+        dx = s.self_points[:, 0] - cx - ox
+        dy = s.self_points[:, 1] - cy - oy
+        d = np.hypot(dx, dy)
+        band = (d > 0.5 * R) & (d < 1.6 * R)
+        if not band.any():
+            return 0.0
+        bins = (((np.arctan2(dy[band], dx[band]) + math.pi) / TAU) * 36).astype(int) % 36
+        return len(np.unique(bins)) / 36.0
+
+    def _ring_path_free(self, s: GameState, cx: float, cy: float, ox: float, oy: float,
+                        R: float, inner: float, margin: float) -> float:
+        """Fraction of the planned ring that no *other* snake blocks (the prey inside is fine).
+        Our own body never kills us in slither.io, so only third parties matter here."""
+        if len(s.obstacles) == 0:
+            return 1.0
+        obs = s.obstacles[::3] - np.array([cx + ox, cy + oy], np.float32)
+        obs = obs[np.hypot(obs[:, 0], obs[:, 1]) > inner]          # drop the prey's coil
+        if len(obs) == 0:
+            return 1.0
+        ang = np.linspace(-math.pi, math.pi, 48, endpoint=False)
+        path = np.stack([R * np.cos(ang), R * np.sin(ang)], axis=1)
+        d = np.hypot(path[:, None, 0] - obs[None, :, 0], path[:, None, 1] - obs[None, :, 1]).min(axis=1)
+        return float(np.mean(d >= margin))
+
+    def _find_circle(self, s, tracks, cx, cy, margin, t) -> _Maneuver | None:
+        cfg = self.cfg
+        if not cfg.encircle_enabled or not self._long_enough(s):
+            return None
+        r_max = min(self._ring_radius_max(s), cfg.encircle_orbit_start)
+        best = None
+        for tr in tracks:
+            if tr.dist > cfg.encircle_start_dist or tr.radius > s.self_radius * cfg.encircle_size_ratio:
+                continue
+            # the prey's visible body must fit inside our ring
+            inner = max(cfg.encircle_orbit_min, math.sqrt(max(tr.body_area, 1.0) / math.pi) + 2 * margin)
+            if inner > r_max:
+                continue
+            if self._ring_path_free(s, cx, cy, tr.x, tr.y, r_max, inner, margin) < cfg.ring_path_min_free:
+                continue                                   # someone else is in the way
+            if best is None or tr.dist < best[0].dist:
+                best = (tr, inner)
+        if best is None:
+            return None
+        tr, inner = best
+        return _Maneuver(Mode.ENCIRCLE, tr.id, t, orbit_sign=self._orbit_sign(tr.x, tr.y),
+                         kind="snake", orbit=r_max, inner=inner, last_t=t)
+
+    def _circle_pit(self, s: GameState, zone: LootZone, t: float) -> _Maneuver | None:
+        """Ring around a loot pile, spiralling inwards: eats it and keeps others out."""
+        cfg = self.cfg
+        if not cfg.encircle_enabled or not self._long_enough(s):
+            return None
+        r = min(self._ring_radius_max(s), cfg.loot_radius)
+        if r < cfg.encircle_orbit_min:
+            return None
+        return _Maneuver(Mode.ENCIRCLE, -1, t, orbit_sign=self._orbit_sign(zone.x, zone.y),
+                         kind="pit", orbit=r, inner=2.5 * max(s.self_radius, cfg.min_self_radius),
+                         zone=zone, last_t=t)
 
     def _find_cutoff(self, s, tracks, cx, cy, margin, t) -> _Maneuver | None:
         cfg = self.cfg
@@ -572,18 +697,36 @@ class Brain:
             return m.hold_angle, False
 
         if m.mode is Mode.ENCIRCLE:
-            if tr is None or t - m.started > cfg.encircle_max_s or tr.dist > cfg.encircle_abort_dist:
-                self.maneuver = None
-                return None
-            orbit = max(cfg.encircle_orbit_min, cfg.encircle_orbit_start - cfg.encircle_shrink_px_s * (t - m.started))
-            radial = np.array([tr.x, tr.y]) / max(tr.dist, 1e-6)
+            dtm, m.last_t = t - m.last_t, t
+            if m.kind == "pit":
+                if m.zone not in self.zones or t - m.started > cfg.encircle_max_s:
+                    self.maneuver = None             # pile eaten / gone
+                    return None
+                ox, oy = m.zone.x, m.zone.y
+                m.orbit -= cfg.pit_spiral_px_s * dtm  # spiral inwards over the orbs
+                if m.orbit < m.inner:
+                    self.maneuver = None
+                    return None
+            else:
+                if tr is None or t - m.started > cfg.encircle_max_s or tr.dist > cfg.encircle_abort_dist:
+                    self.maneuver = None             # prey died (LOOT takes over) or escaped
+                    return None
+                ox, oy = tr.x, tr.y
+                m.coverage = self._ring_coverage(s, cx, cy, ox, oy, m.orbit)
+                if m.coverage >= cfg.ring_closed:    # walled in: tighten slowly until it dies
+                    m.orbit = max(m.inner, m.orbit - cfg.encircle_shrink_px_s * dtm)
+            m.center = (ox, oy)
+            dist = max(math.hypot(ox, oy), 1e-6)
+            radial = np.array([ox, oy]) / dist
             tangent = m.orbit_sign * np.array([-radial[1], radial[0]])
-            direction = tangent + cfg.encircle_gain * (tr.dist - orbit) / orbit * radial
+            direction = tangent + cfg.encircle_gain * (dist - m.orbit) / m.orbit * radial
             angle = math.atan2(direction[1], direction[0])
             if p.clear[int(self.sector_of(angle))] < cfg.hard_min_clearance:
                 self.maneuver = None
                 return None
-            return angle, can_boost and tr.dist > 1.4 * orbit   # prey is escaping the ring
+            # boost to close the ring before the prey slips out; never while tightening
+            closing = m.kind == "snake" and m.coverage < cfg.ring_closed
+            return angle, can_boost and (closing or dist > 1.4 * m.orbit)
 
         if m.mode is Mode.HUNT:
             if tr is None or t - m.started > cfg.hunt_max_s or tr.dist > 1.3 * cfg.hunt_radius:

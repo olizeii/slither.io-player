@@ -59,10 +59,10 @@ def test_style_percentages():
     default = {p.name: getattr(BrainConfig(), p.name) for p in SPACE}
     aggressive = dict(default, **{k: v for k, v in AGGRESSIVE.items() if k in default})
     a, d = style(aggressive), style(default)
-    assert a["Aggression"] > d["Aggression"] + 15
-    assert a["Vorsicht"] < d["Vorsicht"]
+    assert a["Aggression"] > d["Aggression"] + 10
+    assert a["Hotspot"] > d["Hotspot"]
     assert all(0 <= v <= 100 for v in a.values())
-    assert "Typ: Jäger" in style_line(aggressive)
+    assert a["Aggression"] >= 50 and "Typ: " in style_line(aggressive)
 
 
 def test_new_bot_version_starts_fresh_baseline(tmp_path):

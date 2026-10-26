@@ -103,6 +103,7 @@ class VisionConfig:
         [0.90, 0.83, 1.00, 1.00],   # minimap + server label
     ])
     max_obstacle_points: int = 8000
+    max_self_points: int = 1500
 
 
 @dataclass
@@ -183,6 +184,25 @@ class BrainConfig:
     loot_boost_dist: float = 120.0
     loot_min_mass: float = 40.0           # zone is eaten up below this
     loot_item_min_weight: float = 60.0    # food weight that counts as a dead-snake orb
+    death_min_orbs: int = 4               # a death needs several separate orbs ...
+    death_clear_radius: float = 50.0      # ... and no living body left right there
+    death_max_body_pts: int = 25
+    kill_credit_s: float = 3.0            # it died <3 s after we attacked it -> our kill
+    kill_credit_dist: float = 120.0       # ... or it died next to our head / body
+
+    # --- pro loop: grow a bit, then hotspot -> kill -> loot -> repeat ---------
+    grow_until_length: int = 60           # HUD length below which we only farm (start of round)
+    grow_until_area: int = 900            # same, if OCR is off (own visible area in px)
+    hotspot_arrive: float = 0.06          # minimap radii: closer than this = we are there
+    w_travel: float = 1.0                 # pull towards the hotspot while travelling
+    travel_food_share: float = 0.35       # eat on the way, but don't get side-tracked
+
+    # --- circling: ring our body around prey / a loot pile ---------------------
+    circle_min_length: int = 400          # HUD length needed before we try to circle
+    ring_slack: float = 1.25              # body must be 25 % longer than the ring
+    ring_path_min_free: float = 0.85      # planned ring must be free of third-party snakes
+    ring_closed: float = 0.75             # body covers 75 % of the ring -> start tightening
+    pit_spiral_px_s: float = 25.0         # how fast we spiral into a circled pile
     # PIT: big accumulations of food anywhere in view (several dead snakes, big kills)
     pit_enabled: bool = True
     pit_cell: float = 70.0
@@ -249,6 +269,7 @@ class HudConfig:
     length_regex: str = r"(?:L[äa]nge|length)\D{0,4}(\d+)"
     rank_regex: str = r"(?:rang|rank)\D{0,4}(\d+)\D{1,6}(\d+)"
     final_regex: str = r"(?:war|was)\D{0,3}(\d+)"
+    max_growth_per_s: float = 40.0        # overnight data: median 3/s, p90 5.5/s; OCR outliers 400+/s
 
 
 @dataclass
@@ -275,20 +296,23 @@ class BotConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
 
 
-# Starting point for --aggressive / --train: little fear, constant hunting, boosts a lot.
-# v2 (after first user feedback "too passive"): attacks bigger snakes too, cuts off
-# without boost, reacts to heads only when they really rush at us.
+# Starting point for --aggressive / --train.
+# v3 (after the overnight run, 651 rounds): aggressive in *what* it does - hotspots
+# first, cut off and circle whatever is not bigger than us - but not suicidal in *how*
+# it moves. The night's data (tools/evaluate.py) said: more clearance (+0.20), less
+# wide hunting (-0.19), no attacks on bigger snakes (-0.17), boosting later (+0.18)
+# went along with longer rounds; median survival was only 30 s.
 AGGRESSIVE = {
-    "w_danger": 2.0, "danger_radius": 90.0, "clearance_factor": 1.2,
-    "hard_min_clearance": 24.0, "escape_danger": 0.8, "head_threat_radius": 110.0,
-    "head_threat_closing_speed": 80.0,
-    "w_food": 1.4, "feast_threshold": 120.0, "boost_min_self_area": 500,
-    "cutoff_size_ratio": 2.2, "cutoff_max_dist": 450.0, "cutoff_time_margin": 1.0,
+    "w_danger": 3.0, "danger_radius": 110.0, "clearance_factor": 1.7,
+    "hard_min_clearance": 28.0, "escape_danger": 0.7, "head_threat_radius": 150.0,
+    "head_threat_closing_speed": 60.0,
+    "w_food": 1.4, "feast_threshold": 150.0, "boost_min_self_area": 1000,
+    "cutoff_size_ratio": 1.3, "cutoff_max_dist": 400.0, "cutoff_time_margin": 0.9,
     "cutoff_min_enemy_speed": 30.0, "encircle_min_self_area": 2500,
-    "encircle_size_ratio": 1.0, "hunt_enabled": True, "hunt_radius": 520.0,
-    "hunt_size_ratio": 1.5, "w_crowd": 0.6, "loot_boost_dist": 60.0,
+    "encircle_size_ratio": 0.8, "hunt_enabled": True, "hunt_radius": 380.0,
+    "hunt_size_ratio": 1.0, "w_crowd": 0.6, "loot_boost_dist": 60.0, "w_travel": 1.2,
 }
-PROFILE_VERSION = 2   # bump when behaviour changes so much that old tuning scores are meaningless
+PROFILE_VERSION = 3   # bump when behaviour changes so much that old tuning scores are meaningless
 
 
 def apply_brain_params(cfg: BotConfig, params: dict) -> None:

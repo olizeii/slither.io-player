@@ -112,12 +112,14 @@ class Stats:
         self.modes: dict[str, int] = {}
         self.style = ""              # short play-style tag, set by run()
 
-    def tick(self, work_s: float, latency_s: float, mode: Mode, extra: str = "") -> None:
+    def tick(self, work_s: float, latency_s: float, mode: Mode, extra: str = "",
+             phase: str | None = None) -> None:
         self.frames += 1
         self.work += work_s
         self.latency += latency_s
         if mode is not Mode.DEAD:
-            self.modes[mode.value] = self.modes.get(mode.value, 0) + 1
+            key = phase or mode.value                  # pro-loop phase: FARM/TRAVEL/ATTACK/...
+            self.modes[key] = self.modes.get(key, 0) + 1
         now = time.perf_counter()
         if now - self.t0 >= self.interval:
             self.fps = self.frames / (now - self.t0)
@@ -253,6 +255,9 @@ def run(cfg: BotConfig, train: bool = False) -> None:
                 minimap_ts = crops[0]
                 minimap_info = analyze_minimap(crops[1].get("minimap"), cfg.vision, minimap_ts)
             apply_minimap(state, minimap_info, t0)
+            hv = hud.snapshot()
+            if hud.available and hv.length is not None and t0 - hv.timestamp < 3.0:
+                state.length = hv.length                       # self-awareness: how long are we?
             action = brain.decide(state)
             t1 = time.perf_counter()
 
@@ -265,6 +270,9 @@ def run(cfg: BotConfig, train: bool = False) -> None:
             if tracker is not None and running:
                 episode = tracker.update(state, action, t1)
                 if episode is not None:
+                    episode.kills = brain.stats["kills"]
+                    episode.deaths_seen = brain.stats["deaths_seen"]
+                    episode.loot_zones = brain.stats["loot_runs"]
                     print(tuner.report(episode))
                     role, params = tuner.next_params()
                     apply_brain_params(cfg, params)
@@ -275,9 +283,10 @@ def run(cfg: BotConfig, train: bool = False) -> None:
             if cfg.runtime.auto_respawn and running and (tracker is None or tracker.phase != "ending"):
                 respawner.update(state, t1)
 
-            hv = hud.snapshot()
             extra = f"Länge {hv.length} Rang {hv.rank}/{hv.players}" if hud.available else "kein OCR"
-            stats.tick(t1 - t0, t1 - frame.timestamp, action.mode, extra)
+            extra += f" Kills {brain.stats['kills']}"
+            stats.tick(t1 - t0, t1 - frame.timestamp, action.mode, extra,
+                       phase=action.debug.get("phase") if action.debug else None)
             if show_debug and frame_no % cfg.runtime.debug_every == 0:
                 info = stats.text + (" PAUSED" if paused else "") + (f" [{role}]" if train else "")
                 cv2.imshow(debug_view.WINDOW, debug_view.render(frame.image, state, action, info))

@@ -74,10 +74,14 @@ SPACE = [
     Param("hunt_offset", 40.0, 200.0, log=True),
     Param("loot_max_dist", 250.0, 700.0),
     Param("loot_boost_dist", 40.0, 400.0, log=True),
-    Param("pit_min_mass", 150.0, 1500.0, log=True),
+    Param("pit_min_mass", 400.0, 2000.0, log=True),
     Param("w_crowd", 0.0, 1.2),
     Param("head_threat_closing_speed", 30.0, 200.0, log=True),
     Param("hunt_size_ratio", 0.6, 2.5),
+    Param("w_travel", 0.2, 2.5, log=True),
+    Param("grow_until_length", 15, 400, log=True, integer=True),
+    Param("circle_min_length", 150, 3000, log=True, integer=True),
+    Param("ring_closed", 0.5, 0.95),
 ]
 PARAMS = {p.name: p for p in SPACE}
 
@@ -86,16 +90,17 @@ STYLES = {
     "Aggression": [("cutoff_size_ratio", 1), ("cutoff_max_dist", 1), ("cutoff_time_margin", 1),
                    ("hunt_radius", 1), ("hunt_size_ratio", 1), ("encircle_size_ratio", 1),
                    ("encircle_min_self_area", -1), ("boost_min_self_area", -1),
+                   ("circle_min_length", -1), ("grow_until_length", -1),
                    ("w_danger", -1), ("danger_radius", -1)],
     "Vorsicht": [("w_danger", 1), ("danger_radius", 1), ("clearance_factor", 1),
                  ("hard_min_clearance", 1), ("head_threat_radius", 1), ("head_predict_horizon_s", 1),
                  ("escape_danger", -1), ("head_threat_closing_speed", -1)],
     "Gier": [("w_food", 1), ("food_dist_scale", 1), ("feast_threshold", -1)],
     "Loot": [("loot_max_dist", 1), ("loot_boost_dist", -1), ("pit_min_mass", -1)],
-    "Crowd": [("w_crowd", 1)],
+    "Hotspot": [("w_crowd", 1), ("w_travel", 1)],
 }
 STYLE_NAMES = {"Aggression": "Jäger", "Vorsicht": "Überlebender", "Gier": "Sammler",
-               "Loot": "Aasfresser", "Crowd": "Gedränge-Sucher"}
+               "Loot": "Aasfresser", "Hotspot": "Hotspot-Jäger"}
 
 
 def style(params: dict) -> dict[str, int]:
@@ -133,13 +138,27 @@ class Episode:
     players: int | None
     peak_radius: float
     modes: dict
+    kills: int = 0
+    deaths_seen: int = 0          # snakes that died in view (kills by anyone)
+    loot_zones: int = 0
+
+    @property
+    def length(self) -> int | None:
+        """The death screen's 'final length' is clean text; the in-game HUD is only a
+        fallback (overnight logs: peak misreads up to 29301 for a final length of 391)."""
+        return self.final_length or self.peak_length
 
     def score(self) -> float:
-        if self.final_length or self.peak_length:
-            length = max(self.final_length or 0, self.peak_length or 0)
-            return math.log(max(length, 1))
+        if self.length:
+            return math.log(max(self.length, 1))
         # vision proxy without OCR: thickness grows with length, plus survival
         return math.log(1.0 + 10.0 * self.peak_radius ** 2 + self.duration_s)
+
+
+# old logs (before v3) have only the first 12 columns; csv.DictReader leaves the rest empty
+LOG_COLUMNS = ["time", "round", "role", "score", "final_length", "peak_length", "best_rank",
+               "players", "duration_s", "peak_radius", "modes", "params",
+               "kills", "deaths_seen", "loot_zones", "version"]
 
 
 def _mean(xs: list[float]) -> float:
@@ -165,6 +184,13 @@ class Tuner:
             "version": version, "lengths": [],
         }
         self.notice = ""
+        if self.log_path.exists():
+            with self.log_path.open(encoding="utf-8") as f:
+                header = f.readline().strip().split(",")
+            if header != LOG_COLUMNS:            # older log format: keep it, start a new file
+                archive = self.dir / f"episodes_old_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+                self.log_path.rename(archive)
+                self.notice += f"[train] old log archived as {archive.name}\n"
         if self.state_path.exists():
             self.state.update(json.loads(self.state_path.read_text(encoding="utf-8")))
             if self.state.get("version") != version:
@@ -172,9 +198,13 @@ class Tuner:
                 # so start a fresh baseline from the new profile (history stays in the CSV)
                 self.state.update(incumbent=start, incumbent_scores=[], candidate=None,
                                   candidate_scores=[], sigma=cfg.sigma_start, version=version,
-                                  lengths=[], current_role="incumbent")
-                self.notice = (f"[train] new bot version {version}: tuning starts a fresh baseline "
-                               "from the new profile (old rounds stay in episodes.csv)")
+                                  lengths=[], current_role="incumbent", best_length=0,
+                                  best_rank=None, accepted=0, rejected=0)
+                best = self.dir / "best_params.json"
+                if best.exists():
+                    best.replace(self.dir / "best_params_old.json")
+                self.notice += (f"[train] new bot version {version}: tuning starts a fresh baseline "
+                                "from the new profile (old rounds stay in the archived log)")
             # parameters added in a newer version: start them at the current defaults
             for role in ("incumbent", "candidate"):
                 if self.state[role] is not None:
@@ -203,7 +233,7 @@ class Tuner:
         role = s["current_role"]
         score = ep.score()
         s["episodes"] += 1
-        length = max(ep.final_length or 0, ep.peak_length or 0)
+        length = ep.length or 0
         s["best_length"] = max(s["best_length"], length)
         if ep.best_rank is not None and (s["best_rank"] is None or ep.best_rank < s["best_rank"]):
             s["best_rank"] = ep.best_rank
@@ -219,6 +249,7 @@ class Tuner:
         self._save()
         rank = f"{ep.best_rank}/{ep.players}" if ep.best_rank else "?"
         return (f"[train] round {s['episodes']} ({role}) length={length or '?'} rank={rank} "
+                f"kills={ep.kills} loot={ep.loot_zones} "
                 f"time={ep.duration_s / 60:.1f}min score={score:.2f} | incumbent mean="
                 f"{_mean(s['incumbent_scores']):.2f} sigma={s['sigma']:.3f} "
                 f"best length={s['best_length']} best rank={s['best_rank']} {verdict}\n"
@@ -294,9 +325,9 @@ class Tuner:
         with self.log_path.open("a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new:
-                w.writerow(["time", "round", "role", "score", "final_length", "peak_length",
-                            "best_rank", "players", "duration_s", "peak_radius", "modes", "params"])
+                w.writerow(LOG_COLUMNS)
             w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), self.state["episodes"], role,
                         f"{score:.3f}", ep.final_length, ep.peak_length, ep.best_rank, ep.players,
                         f"{ep.duration_s:.1f}", f"{ep.peak_radius:.1f}", json.dumps(ep.modes),
-                        json.dumps(self.state[role])])
+                        json.dumps(self.state[role]), ep.kills, ep.deaths_seen, ep.loot_zones,
+                        self.state.get("version")])

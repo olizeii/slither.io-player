@@ -50,6 +50,7 @@ Ein Computer-Vision-Bot für [slither.io](http://slither.io). Er liest nur den B
 | Episode | `slither_bot/episode.py` | erkennt Rundenstart und -ende, sammelt Statistiken |
 | Minimap | `slither_bot/minimap.py` | eigene Position + Richtung zum nächsten dichten Gebiet |
 | Tuner | `slither_bot/tuner.py` | (1+1)-ES: lernt die Parameter zwischen den Runden |
+| Analysis | `slither_bot/analysis.py` | Log-Auswertung, Ausreißer-Filter, Dashboard (`tools/evaluate.py`) |
 | Main | `slither_bot/main.py` | verbindet alles, Main-Loop, Respawn, Training, Statistik |
 | Kalibrierung | `tools/calibrate.py` | HSV-Schwellwerte live per Trackbar einstellen |
 
@@ -251,6 +252,56 @@ Konsolenausgabe pro Runde, zum Beispiel:
 Ehrliche Erwartung: Eine Runde dauert Minuten, das sind etwa 10–20 Runden pro Stunde. Spürbare Verbesserungen brauchen einige Dutzend Runden, also einen Tag Laufzeit ist realistisch für ein gut getuntes Profil. Platz 1 hängt stark vom Server ab (wie viele große Spieler gerade online sind). In `episodes.csv` siehst du, ob die Kurve steigt.
 
 ---
+
+## 4c. v3: Pro-Loop, Circling, Auswertung
+
+### Was die Nacht (651 Runden, v2) gezeigt hat
+
+`python tools/evaluate.py` auf den Overnight-Daten:
+
+- **Runden waren extrem kurz:** Median 30 s Überleben, Median-Länge 86, beste echte Länge 761.
+- **OCR-Fehllesungen haben das Training vergiftet.** Peak-Längen wie 29 301 bei echter Endlänge 391, „Rang 0“, „Rang 1 von 247“ bei Länge 151. Der Tuner hielt das für Erfolge und hat 43 „Verbesserungen“ übernommen.
+- **LOOT lief 26 % der Zeit, in kurzen wie langen Runden gleich.** Die Ursache: Flackerte die Augenerkennung einer *lebenden* Schlange kurz, sah das aus wie „Kopf weg, augenloser Blob da = tot“. In der Loot-Zone wurde dieser Blob dann nicht mehr als Hindernis gezählt, und der Bot fuhr hinein.
+- **Was mit längeren Runden einherging:** mehr Abstand, weniger weites Jagen, keine Angriffe auf größere Schlangen, später boosten.
+
+Behoben in v3:
+- **OCR:** Jeder Wert muss zweimal hintereinander gelesen werden und physikalisch möglich sein (max. +40 Länge/s, `hud.PlausibleValue`). Bewertet wird die Endlänge vom Todesbildschirm.
+- **Tod:** zählt nur, wenn ≥ 4 separate große Kugeln auftauchen **und** an der Stelle kein Körper mehr liegt. Hindernisse werden nie mehr ignoriert.
+- **Neustart des Lernens:** Beim ersten Start mit v3 wird das alte Log archiviert (`episodes_old_*.csv`), `best_params.json` wird zu `best_params_old.json`, und das Training beginnt eine frische Baseline.
+
+### Der Pro-Loop (`brain.Brain.decide`)
+
+```
+1. SURVIVE  Kopf rast auf uns zu / kein Platz mehr       -> ausweichen (immer zuerst)
+2. LOOT     bestätigter Kill oder Haufen aus Kugeln      -> sofort hin, Boost ab 60 px
+3. CIRCLE   wir sind lang genug + kleinere Beute/Haufen  -> Ring legen, schließen, zuziehen
+4. ATTACK   Kopf in Reichweite, nicht größer als wir     -> Cutoff (auch ohne Boost) / Hunt
+5. TRAVEL   nichts zu kämpfen in Sicht                   -> zum Hotspot der Minimap
+6. FARM     Runde gerade gestartet (Länge < 60)          -> erst wachsen, dann jagen
+   PATROL   im Hotspot angekommen, kein Ziel             -> fressen, Richtung Gedränge
+```
+
+Die aktuelle Phase steht im Debug-Fenster (`phase=`) und in der Konsole (`gerade: TRAVEL 60% ATTACK 25% ...`). Jede Runde wird mit ihren Phasen-Anteilen, Kills, gesehenen Toden und Loot-Läufen in `episodes.csv` geschrieben.
+
+### Circling
+
+- **Länge:** Der Bot kennt seine Länge (HUD per OCR) und seine sichtbare Körperlänge in Pixeln (Fläche / Dicke). Er kreist erst ab Länge 400 (`circle_min_length`), und nur Ringe, deren Umfang × 1,25 in seinen Körper passt.
+- **Passt die Beute hinein?** Die sichtbare Körperfläche der Beute bestimmt den kleinsten Ring (`inner`).
+- **Ist der Weg frei?** Der geplante Ring wird an 48 Punkten gegen fremde Schlangen geprüft (≥ 85 % frei). Der eigene Körper ist in slither.io harmlos, gefährlich sind nur Dritte.
+- **Schließt sich der Ring?** Die eigenen Körperpunkte werden nach Winkel um die Beute in 36 Sektoren einsortiert. Erst ab 75 % Abdeckung zieht der Bot den Ring zu, und nie enger als `inner`. Während der Ring noch offen ist, boostet er, um ihn schnell zu schließen.
+- **Ende:** Stirbt die Beute, übernimmt LOOT die Kugeln im Inneren. Haufen werden spiralförmig nach innen eingekreist, so frisst er sie und hält andere fern.
+
+Im Debug-Fenster: gelber Kreis = geplanter Ring, `ring 80%` = wie geschlossen er ist.
+
+### Auswertung
+
+```bash
+python tools/evaluate.py
+```
+
+Gibt Gesamtstatistik, Top-10-Runden (Länge, Rang, Überlebenszeit, Kills, Spielstil, Phasen), Lernkurve in 50er-Blöcken, Zeitanteile der besten 10 % gegenüber allen und Parameter-Korrelationen aus. Dazu kommt das Dashboard `tuning/report.png`. Optionen: `--top 20`, `--only-new` (nur v3), `--show` (Fenster öffnen).
+
+**Lernt der Bot aus diesen Daten?** Gelernt wird aus `tuning/state.json`: der aktuell beste Parametersatz und seine letzten Scores. `episodes.csv` ist das Protokoll für dich und `evaluate.py`. Der Bot liest es nicht. Die Korrelationen aus `evaluate.py` sind der Hinweis, welche Richtung lohnt. Das v3-Startprofil ist genau so aus den Nachtdaten abgeleitet.
 
 ## 5. Strategie: Heuristik oder Reinforcement Learning?
 

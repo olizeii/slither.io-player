@@ -49,6 +49,12 @@ def render(frame: np.ndarray, state: GameState, action: Action | None = None,
             cv2.circle(img, (int(cx + z.x), int(cy + z.y)), 40, color, 2)
             cv2.putText(img, f"{z.source} {z.mass:.0f}", (int(cx + z.x) - 30, int(cy + z.y) - 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        ring = dbg.get("ring")                     # circling: planned ring + how closed it is
+        if ring is not None:
+            (ox, oy), radius, coverage = ring
+            cv2.circle(img, (int(cx + ox), int(cy + oy)), int(radius), (0, 215, 255), 2)
+            cv2.putText(img, f"ring {100 * coverage:.0f}%", (int(cx + ox) - 30, int(cy + oy)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 1, cv2.LINE_AA)
         if state.crowd_angle is not None:          # minimap crowd direction: orange arrow
             a = state.crowd_angle
             cv2.arrowedLine(img, (int(cx), int(cy)), (int(cx + 90 * math.cos(a)), int(cy + 90 * math.sin(a))),
@@ -63,8 +69,9 @@ def render(frame: np.ndarray, state: GameState, action: Action | None = None,
 
     if state.border_angle is not None:
         info += f" border={state.border_proximity:.2f}"
+    phase = (action.debug or {}).get("phase", "-") if action else "-"
     lines = [info,
-             f"mode={action.mode.value if action else '-'} boost={action.boost if action else '-'} "
+             f"phase={phase} mode={action.mode.value if action else '-'} boost={action.boost if action else '-'} "
              f"alive={state.alive} r={state.self_radius:.1f} area={state.self_area} "
              f"food={len(state.food)} heads={len(state.heads)}"]
     for i, text in enumerate(lines):

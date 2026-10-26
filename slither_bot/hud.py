@@ -46,6 +46,43 @@ def parse_final(text: str, cfg: HudConfig) -> int | None:
     return int(m.group(1)) if m else None
 
 
+class PlausibleValue:
+    """Filters OCR numbers.
+
+    * A value is only accepted when two consecutive readings agree (±10 %).
+    * With ``max_rise_per_s`` set, an accepted value may then only grow as fast as
+      the game allows; a bigger jump needs confirmation again (new round, misread).
+    """
+
+    def __init__(self, max_rise_per_s: float | None, slack: float = 30.0) -> None:
+        self.max_rise = max_rise_per_s
+        self.slack = slack
+        self.value: int | None = None
+        self._t = 0.0
+        self._pending: int | None = None
+
+    @staticmethod
+    def _close(a: int, b: int) -> bool:
+        return abs(a - b) <= max(3, 0.1 * max(a, b))
+
+    def update(self, x: int | None, t: float) -> int | None:
+        if x is None or not (0 < x < 1_000_000):
+            return self.value
+        if self.value is not None and self.max_rise is not None:
+            dt = max(t - self._t, 0.0)
+            if 0.5 * self.value - self.slack <= x <= self.value + self.max_rise * dt + self.slack:
+                self.value, self._t, self._pending = x, t, None
+                return x
+        elif self.value is not None and self._close(x, self.value):
+            self.value, self._t, self._pending = x, t, None
+            return x
+        if self._pending is not None and self._close(x, self._pending):
+            self.value, self._t, self._pending = x, t, None   # confirmed jump / new value
+            return x
+        self._pending = x
+        return self.value
+
+
 class HudReader(threading.Thread):
     def __init__(self, buffer: LatestFrameBuffer, cfg: HudConfig) -> None:
         super().__init__(daemon=True, name="hud-ocr")
@@ -54,6 +91,11 @@ class HudReader(threading.Thread):
         self.values = HudValues()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        # overnight logs showed OCR misreads like 29301 for a length of 391: every
+        # value must be physically plausible and confirmed before it counts
+        self._length = PlausibleValue(max_rise_per_s=cfg.max_growth_per_s)
+        self._rank = PlausibleValue(max_rise_per_s=None)
+        self._final = PlausibleValue(max_rise_per_s=None)
         self.available = False
         self.error: str | None = None
         try:
@@ -96,6 +138,10 @@ class HudReader(threading.Thread):
                 self.error = f"OCR failed: {exc!r}"
                 self.available = False
                 return
+            length = self._length.update(length, ts)
+            rank_ok = rank is not None and players is not None and 1 <= rank <= players and players >= 2
+            rank = self._rank.update(rank if rank_ok else None, ts)
+            final = self._final.update(final, ts)
             with self._lock:
                 v = self.values
                 if length is not None:

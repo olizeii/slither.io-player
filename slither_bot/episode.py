@@ -48,7 +48,8 @@ class EpisodeTracker:
             if state.alive:
                 self.last_alive = now
                 self.peak_radius = max(self.peak_radius, state.self_radius)
-                self.modes[action.mode.value] = self.modes.get(action.mode.value, 0.0) + dt
+                key = (action.debug or {}).get("phase") or action.mode.value
+                self.modes[key] = self.modes.get(key, 0.0) + dt
             if hv is not None and hv.timestamp > self.started:
                 if hv.length is not None:
                     self.peak_length = max(self.peak_length or 0, hv.length)
