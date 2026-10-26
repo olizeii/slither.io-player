@@ -1,0 +1,124 @@
+"""Low-latency screen capture running in its own thread.
+
+The capture thread grabs the game region, downsamples it to the analysis
+resolution and publishes it into a single-slot buffer. The consumer always
+gets the *newest* frame; stale frames are dropped instead of queued, so a
+slow analysis step never builds up latency.
+
+Backends (fastest first):
+  * dxcam / bettercam - DXGI Desktop Duplication, 100-240 FPS, Windows only
+  * mss               - GDI/X11/Quartz, ~30-60 FPS for a 1080p region
+"""
+from __future__ import annotations
+
+import importlib
+import threading
+import time
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+from .config import CaptureConfig
+
+
+@dataclass
+class Frame:
+    image: np.ndarray     # BGR, analysis resolution
+    frame_id: int
+    timestamp: float      # time.perf_counter() at grab time
+
+
+class LatestFrameBuffer:
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._frame: Frame | None = None
+        self._next_id = 1
+
+    def publish(self, image: np.ndarray, timestamp: float) -> None:
+        with self._cond:
+            self._frame = Frame(image, self._next_id, timestamp)
+            self._next_id += 1
+            self._cond.notify_all()
+
+    def wait_newer(self, last_id: int, timeout: float) -> Frame | None:
+        with self._cond:
+            self._cond.wait_for(
+                lambda: self._frame is not None and self._frame.frame_id > last_id, timeout
+            )
+            frame = self._frame
+        return frame if frame is not None and frame.frame_id > last_id else None
+
+
+def pick_backend(name: str) -> str:
+    candidates = ["dxcam", "bettercam", "mss"] if name == "auto" else [name]
+    for candidate in candidates:
+        try:
+            importlib.import_module(candidate)
+            return candidate
+        except ImportError:
+            continue
+    raise RuntimeError(f"no capture backend available (tried {candidates})")
+
+
+class ScreenCapture(threading.Thread):
+    def __init__(self, region: tuple[int, int, int, int], cfg: CaptureConfig,
+                 buffer: LatestFrameBuffer) -> None:
+        super().__init__(daemon=True, name="capture")
+        self.region = region            # left, top, width, height (screen pixels)
+        self.cfg = cfg
+        self.buffer = buffer
+        self.backend = pick_backend(cfg.backend)
+        self.error: BaseException | None = None
+        self._stop_event = threading.Event()
+        w, h = region[2], region[3]
+        self.out_size = (max(1, int(w * cfg.scale)), max(1, int(h * cfg.scale)))
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _publish(self, bgr: np.ndarray, ts: float) -> None:
+        if self.cfg.scale != 1.0:
+            # INTER_AREA averages pixels: small food stays visible after downscaling
+            bgr = cv2.resize(bgr, self.out_size, interpolation=cv2.INTER_AREA)
+        self.buffer.publish(bgr, ts)
+
+    def run(self) -> None:
+        try:
+            if self.backend in ("dxcam", "bettercam"):
+                self._run_dxgi()
+            else:
+                self._run_mss()
+        except BaseException as exc:  # surfaced by the main loop
+            self.error = exc
+
+    def _run_dxgi(self) -> None:
+        lib = importlib.import_module(self.backend)
+        left, top, w, h = self.region
+        # dxcam regions are relative to the output (primary monitor)
+        camera = lib.create(output_color="BGR")
+        camera.start(target_fps=self.cfg.target_fps, region=(left, top, left + w, top + h),
+                     video_mode=True)
+        try:
+            while not self._stop_event.is_set():
+                img = camera.get_latest_frame()   # blocks until the next frame
+                if img is None:
+                    continue
+                self._publish(img, time.perf_counter())
+        finally:
+            camera.stop()
+
+    def _run_mss(self) -> None:
+        import mss
+
+        left, top, w, h = self.region
+        monitor = {"left": left, "top": top, "width": w, "height": h}
+        period = 1.0 / self.cfg.target_fps
+        with mss.mss() as sct:           # mss instances are not thread safe: create here
+            while not self._stop_event.is_set():
+                t0 = time.perf_counter()
+                bgra = np.asarray(sct.grab(monitor))
+                self._publish(cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR), t0)
+                rest = period - (time.perf_counter() - t0)
+                if rest > 0:
+                    time.sleep(rest)

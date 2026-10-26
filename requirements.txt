@@ -1,0 +1,6 @@
+numpy>=1.26
+opencv-python>=4.9
+mss>=9.0                       # cross-platform capture fallback
+dxcam>=0.0.5; sys_platform == "win32"     # DXGI Desktop Duplication (fastest on Windows)
+pynput>=1.7; sys_platform != "win32"      # input fallback outside Windows
+pytest>=8.0
