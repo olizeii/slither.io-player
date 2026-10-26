@@ -99,6 +99,22 @@ def reset_timer_resolution(ms: int = 1) -> None:
         ctypes.windll.winmm.timeEndPeriod(ms)
 
 
+def visible_window_titles() -> list[str]:
+    _require_windows()
+    titles: list[str] = []
+
+    def callback(hwnd, _lparam):
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length and user32.IsWindowVisible(hwnd):
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            titles.append(buf.value)
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(callback), 0)
+    return titles
+
+
 def find_window(title_regex: str) -> int | None:
     """Return the first visible top-level window whose title matches."""
     _require_windows()
@@ -131,6 +147,12 @@ def client_rect_on_screen(hwnd: int) -> tuple[int, int, int, int]:
     origin = wintypes.POINT(0, 0)
     user32.ClientToScreen(hwnd, ctypes.byref(origin))
     return origin.x, origin.y, rect.right - rect.left, rect.bottom - rect.top
+
+
+def primary_screen_size() -> tuple[int, int] | None:
+    if not IS_WINDOWS:
+        return None
+    return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)   # SM_CXSCREEN, SM_CYSCREEN
 
 
 def foreground_window() -> int | None:

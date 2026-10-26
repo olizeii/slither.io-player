@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from . import win32
 from .config import CaptureConfig
 
 
@@ -61,6 +62,14 @@ def pick_backend(name: str) -> str:
     raise RuntimeError(f"no capture backend available (tried {candidates})")
 
 
+def _on_primary_monitor(region: tuple[int, int, int, int]) -> bool:
+    size = win32.primary_screen_size()
+    if size is None:
+        return True
+    left, top, w, h = region
+    return left >= 0 and top >= 0 and left + w <= size[0] and top + h <= size[1]
+
+
 class ScreenCapture(threading.Thread):
     def __init__(self, region: tuple[int, int, int, int], cfg: CaptureConfig,
                  buffer: LatestFrameBuffer) -> None:
@@ -69,6 +78,11 @@ class ScreenCapture(threading.Thread):
         self.cfg = cfg
         self.buffer = buffer
         self.backend = pick_backend(cfg.backend)
+        if self.backend in ("dxcam", "bettercam") and not _on_primary_monitor(region):
+            # dxcam captures the primary output only; mss handles the whole virtual desktop
+            print("[capture] game is not on the primary monitor -> using mss "
+                  "(move it to the main screen for dxcam speed)")
+            self.backend = pick_backend("mss")
         self.error: BaseException | None = None
         self._stop_event = threading.Event()
         w, h = region[2], region[3]

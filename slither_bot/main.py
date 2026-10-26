@@ -35,8 +35,12 @@ def locate_game(cfg: BotConfig) -> tuple[int | None, tuple[int, int, int, int]]:
         raise SystemExit("window detection needs Windows - pass --region L,T,W,H")
     hwnd = win32.find_window(cfg.capture.window_title_regex)
     if hwnd is None:
-        raise SystemExit("no slither.io browser window found. Open http://slither.io, "
-                         "press F11 for fullscreen, or pass --region L,T,W,H")
+        browsers = ("chrome", "edge", "firefox", "opera", "brave", "vivaldi")
+        seen = [t for t in win32.visible_window_titles() if any(b in t.lower() for b in browsers)]
+        raise SystemExit("no slither.io browser window found. The slither.io tab must be the "
+                         "active tab of its window (title starts with 'slither.io'); press F11 "
+                         "for fullscreen, or pass --region L,T,W,H.\n  browser windows seen: "
+                         + (", ".join(repr(t) for t in seen) or "none"))
     left, top, w, h = win32.client_rect_on_screen(hwnd)
     crop = cfg.capture.crop_top_px
     return hwnd, (left, top + crop, w, h - crop)
